@@ -1,75 +1,75 @@
 # minply
 
-**Minimal audio player for Windows with Bluetooth lag compensation.**
+**Bluetooth レシーバの先頭欠損を自動補償する、超軽量 CLI オーディオプレイヤー**
 
-Bluetooth レシーバの先頭欠損を自動補償する、軽量コマンドラインオーディオプレイヤー。
+通知音などの短い音声を高速軽量に再生するための Windows 用オーディオプレイヤー。
 
-## Features
+## 特徴
 
-- Single-file executable (~211KB), no runtime dependencies
-- Supports MP3, WAV, AAC, FLAC, WMA and other formats (via Windows Media Foundation)
-- Automatic silence padding at the beginning for BLE receiver lag compensation
-- Plays to the default audio device using WASAPI shared mode
-- Exits immediately after playback completes
+- 単一実行ファイル（約 211KB）、ランタイム依存なし
+- MP3, WAV, AAC, FLAC, WMA などの形式に対応（Windows Media Foundation 使用）
+- BLE レシーバの遅延補償のための自動無音挿入（先頭 0.4 秒）
+- WASAPI 共有モードでデフォルトオーディオデバイスに再生
+- 再生完了後に即座に終了
 
-## Usage
+## 使い方
 
 ```
-minply.exe <audio file>
+minply.exe <オーディオファイル>
 ```
 
 ```powershell
-# Play an MP3 file
+# MP3 ファイルを再生
 minply.exe notification.mp3
 
-# Play a WAV file
+# WAV ファイルを再生
 minply.exe alert.wav
 
-# Chain with other commands
-minply.exe done.mp3 && echo "Playback finished"
+# 他のコマンドと連携
+minply.exe done.mp3 && echo "再生完了"
 ```
 
-## Exit Codes
+## 終了コード
 
-| Code | Description |
-|------|-------------|
-| 0 | Success |
-| 1 | Invalid arguments |
-| 2 | File not found |
-| 3 | Decode failed |
-| 4 | Audio device initialization failed |
-| 5 | Playback failed |
+| コード | 説明 |
+|------|------|
+| 0 | 成功 |
+| 1 | 引数が無効 |
+| 2 | ファイルが見つからない |
+| 3 | デコード失敗 |
+| 4 | オーディオデバイスの初期化失敗 |
+| 5 | 再生失敗 |
 
-## Requirements
+## 動作要件
 
-### Runtime
+### 実行
 
-- Windows 10 version 1607 or later (x64)
-- No additional software required (all dependencies are built into Windows)
+- Windows 10 version 1607 以降（x64）
+- 追加のソフトウェアは不要（全ての依存関係は Windows に組み込み済み）
 
-### Build
+### ビルド
 
-- [Visual Studio](https://visualstudio.microsoft.com/) 2019 or later (C++ Desktop Development workload)
-- [PowerShell 7+](https://github.com/PowerShell/PowerShell) (pwsh)
-- [Task](https://taskfile.dev/) (optional, for `task build`)
+- [Visual Studio](https://visualstudio.microsoft.com/) 2019 以降（C++ デスクトップ開発ワークロード）
+- [PowerShell 7+](https://github.com/PowerShell/PowerShell)（pwsh）
+- [Task](https://taskfile.dev/)（オプション、`task build` を使う場合）
 
-## Build
+## ビルド方法
 
 ```powershell
-# Using Taskfile
+# Taskfile を使う場合
 task build
 
-# Using PowerShell directly
+# PowerShell で直接実行する場合
 pwsh -ExecutionPolicy Bypass -File build.ps1
 ```
 
-## How It Works
+## 動作の仕組み
 
-1. Queries the default audio device's native format via WASAPI `GetMixFormat`
-2. Decodes the audio file using Media Foundation, resampling to the device's format
-3. Prepends 0.4 seconds of silence to compensate for BLE receiver wake-up latency
-4. Streams the audio data to the device using WASAPI event-driven shared mode
+1. WASAPI `GetMixFormat` でデフォルトオーディオデバイスのネイティブ形式を取得
+2. Media Foundation でオーディオファイルをデコードし、デバイスの形式にリサンプリング
+3. BLE レシーバのウェイクアップ遅延を補償するため、先頭に 0.4 秒の無音を追加
+4. WASAPI のイベント駆動共有モードでデバイスにオーディオデータをストリーミング
 
-## License
+## ライセンス
 
 MIT
