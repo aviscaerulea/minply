@@ -1,0 +1,16 @@
+# Build artifacts
+out/
+
+# Test files
+*.mp3
+*.wav
+test.bat
+
+# Development plan
+.plan.md
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Visual Studio
+.vs/

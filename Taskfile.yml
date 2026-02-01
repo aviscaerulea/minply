@@ -1,0 +1,23 @@
+version: '3'
+
+tasks:
+  build:
+    desc: minply をビルド
+    cmds:
+      - pwsh -ExecutionPolicy Bypass -File build.ps1
+
+  clean:
+    desc: ビルド成果物を削除
+    cmds:
+      - pwsh -Command "Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue"
+
+  run:
+    desc: test.mp3 を再生
+    deps: [build]
+    cmds:
+      - ./out/minply.exe test.mp3
+
+  default:
+    desc: デフォルトタスク（ビルド）
+    cmds:
+      - task build
