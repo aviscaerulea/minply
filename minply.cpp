@@ -43,7 +43,7 @@
 #define ERR_PLAYBACK_FAILED   5
 
 // Constants
-constexpr float SILENCE_DURATION = 0.4f;  // Silence duration in seconds (BLE lag compensation)
+constexpr float SILENCE_DURATION = 0.5f;  // Silence duration in seconds (BLE lag compensation)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 
 // Print error message to stderr

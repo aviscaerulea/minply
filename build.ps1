@@ -15,7 +15,7 @@ Write-Host ""
 Write-Host "Compiling minply.cpp..." -ForegroundColor Cyan
 
 # コンパイル実行（ログを out/build.log に保存）
-cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /Fo:out/ /Fe:out/minply.exe minply.cpp ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib 2>&1 | Tee-Object -FilePath "out/build.log"
+cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /Fo:out/ /Fe:out/minply.exe minply.cpp ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -FilePath "out/build.log"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red

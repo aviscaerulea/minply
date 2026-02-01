@@ -8,7 +8,8 @@
 
 - 単一実行ファイル（約 211KB）、ランタイム依存なし
 - MP3, WAV, AAC, FLAC, WMA などの形式に対応（Windows Media Foundation 使用）
-- BLE レシーバの遅延補償のための自動無音挿入（先頭 0.4 秒）
+- BLE レシーバの遅延補償のための自動無音挿入（先頭 0.5 秒）
+- バックグラウンド実行（コンソールウィンドウなし）
 - WASAPI 共有モードでデフォルトオーディオデバイスに再生
 - 再生完了後に即座に終了
 
@@ -27,6 +28,9 @@ minply.exe alert.wav
 
 # 他のコマンドと連携
 minply.exe done.mp3 && echo "再生完了"
+
+# エラー出力をキャプチャ
+minply.exe notfound.mp3 2>&1 | Out-File error.log
 ```
 
 ## 終了コード
@@ -67,7 +71,7 @@ pwsh -ExecutionPolicy Bypass -File build.ps1
 
 1. WASAPI `GetMixFormat` でデフォルトオーディオデバイスのネイティブ形式を取得
 2. Media Foundation でオーディオファイルをデコードし、デバイスの形式にリサンプリング
-3. BLE レシーバのウェイクアップ遅延を補償するため、先頭に 0.4 秒の無音を追加
+3. BLE レシーバのウェイクアップ遅延を補償するため、先頭に 0.5 秒の無音を追加
 4. WASAPI のイベント駆動共有モードでデバイスにオーディオデータをストリーミング
 
 ## ライセンス
