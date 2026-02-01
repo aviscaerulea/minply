@@ -40,9 +40,20 @@ minply.exe done.mp3 && echo "Playback finished"
 | 4 | Audio device initialization failed |
 | 5 | Playback failed |
 
-## Build
+## Requirements
 
-Requires Visual Studio 2019 or later with C++17 support.
+### Runtime
+
+- Windows 10 version 1607 or later (x64)
+- No additional software required (all dependencies are built into Windows)
+
+### Build
+
+- [Visual Studio](https://visualstudio.microsoft.com/) 2019 or later (C++ Desktop Development workload)
+- [PowerShell 7+](https://github.com/PowerShell/PowerShell) (pwsh)
+- [Task](https://taskfile.dev/) (optional, for `task build`)
+
+## Build
 
 ```powershell
 # Using Taskfile
@@ -58,10 +69,6 @@ pwsh -ExecutionPolicy Bypass -File build.ps1
 2. Decodes the audio file using Media Foundation, resampling to the device's format
 3. Prepends 0.4 seconds of silence to compensate for BLE receiver wake-up latency
 4. Streams the audio data to the device using WASAPI event-driven shared mode
-
-## Requirements
-
-- Windows 10 version 1607 or later
 
 ## License
 
