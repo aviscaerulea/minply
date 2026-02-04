@@ -44,7 +44,9 @@
 
 // Constants
 constexpr float SILENCE_DURATION = 0.7f;  // Silence duration in seconds (BLE lag compensation)
+constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
+constexpr DWORD DRAIN_WAIT_MS = 300;       // Wait time for device buffer drain in milliseconds
 
 // Print error message to stderr
 void PrintError(const char* message) {
@@ -314,6 +316,30 @@ std::vector<float> GenerateSilence(UINT32 sampleRate, UINT32 channels) {
     return std::vector<float>(silenceSamples, 0.0f);
 }
 
+// Apply fade-in/out to audio data to prevent click noise from waveform discontinuity
+void ApplyFade(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels) {
+    UINT32 fadeFrames = static_cast<UINT32>(sampleRate * FADE_DURATION);
+    UINT32 totalFrames = static_cast<UINT32>(audioData.size() / channels);
+    if (totalFrames < fadeFrames * 2) return; // too short for fade
+
+    // Fade in
+    for (UINT32 i = 0; i < fadeFrames; i++) {
+        float gain = static_cast<float>(i) / fadeFrames;
+        for (UINT32 ch = 0; ch < channels; ch++) {
+            audioData[i * channels + ch] *= gain;
+        }
+    }
+
+    // Fade out
+    UINT32 fadeStart = totalFrames - fadeFrames;
+    for (UINT32 i = fadeStart; i < totalFrames; i++) {
+        float gain = static_cast<float>(totalFrames - i) / fadeFrames;
+        for (UINT32 ch = 0; ch < channels; ch++) {
+            audioData[i * channels + ch] *= gain;
+        }
+    }
+}
+
 // Play audio using WASAPI
 bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
                const std::vector<float>& leadIn = {}) {
@@ -442,7 +468,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
         } while (SUCCEEDED(hr) && numFramesPadding > 0);
 
         // Wait for device buffer to drain
-        Sleep(150);
+        Sleep(DRAIN_WAIT_MS);
 
         // Stop playback
         audioClient->Stop();
@@ -516,6 +542,9 @@ int wmain(int argc, wchar_t* argv[]) {
         } else {
             // MF is no longer needed
             MFShutdown();
+
+            // Apply fade to prevent click noise
+            ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
             // Generate silence buffer
             std::vector<float> silenceData = GenerateSilence(mixFormat->nSamplesPerSec, mixFormat->nChannels);
