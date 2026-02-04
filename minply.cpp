@@ -8,7 +8,7 @@
  *
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC and other audio files
- *   - Automatically adds 0.3 seconds of silence at the beginning (BLE lag compensation)
+ *   - Plays 0.7 seconds of silence before audio playback (BLE lag compensation)
  *   - Exits immediately after playback completes
  *
  * Dependencies:
@@ -43,7 +43,7 @@
 #define ERR_PLAYBACK_FAILED   5
 
 // Constants
-constexpr float SILENCE_DURATION = 0.5f;  // Silence duration in seconds (BLE lag compensation)
+constexpr float SILENCE_DURATION = 0.7f;  // Silence duration in seconds (BLE lag compensation)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 
 // Print error message to stderr
@@ -175,7 +175,8 @@ std::vector<float> GenerateSilence(UINT32 sampleRate, UINT32 channels) {
 }
 
 // Play audio using WASAPI
-bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat) {
+bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
+               const std::vector<float>& leadIn = {}) {
     HRESULT hr;
     IMMDeviceEnumerator* deviceEnumerator = nullptr;
     IMMDevice* device = nullptr;
@@ -254,55 +255,43 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Send audio data
-        size_t totalFrames = audioData.size() / channels;
-        size_t frameIndex = 0;
+        // Play lead-in data (silence for BLE wake-up), then main audio data
+        const std::vector<float>* sources[] = { &leadIn, &audioData };
+        for (const auto* source : sources) {
+            if (source->empty()) continue;
 
-        while (frameIndex < totalFrames) {
-            // Wait for event
-            DWORD waitResult = WaitForSingleObject(eventHandle, BUFFER_WAIT_MS);
-            if (waitResult == WAIT_TIMEOUT) {
-                continue;  // Timeout but data remains, retry
+            size_t totalFrames = source->size() / channels;
+            size_t frameIndex = 0;
+
+            while (frameIndex < totalFrames) {
+                DWORD waitResult = WaitForSingleObject(eventHandle, BUFFER_WAIT_MS);
+                if (waitResult == WAIT_TIMEOUT) continue;
+                if (waitResult != WAIT_OBJECT_0) break;
+
+                UINT32 numFramesPadding;
+                hr = audioClient->GetCurrentPadding(&numFramesPadding);
+                if (FAILED(hr)) break;
+
+                UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
+                if (numFramesAvailable == 0) continue;
+
+                UINT32 framesToWrite = static_cast<UINT32>(
+                    (std::min)(static_cast<size_t>(numFramesAvailable), totalFrames - frameIndex)
+                );
+
+                BYTE* buffer;
+                hr = renderClient->GetBuffer(framesToWrite, &buffer);
+                if (FAILED(hr)) break;
+
+                size_t byteCount = framesToWrite * mixFormat->nBlockAlign;
+                memcpy(buffer, &(*source)[frameIndex * channels], byteCount);
+
+                hr = renderClient->ReleaseBuffer(framesToWrite, 0);
+                if (FAILED(hr)) break;
+
+                frameIndex += framesToWrite;
             }
-            if (waitResult != WAIT_OBJECT_0) {
-                break;  // Error, stop
-            }
-
-            // Get available buffer frames
-            UINT32 numFramesPadding;
-            hr = audioClient->GetCurrentPadding(&numFramesPadding);
-            if (FAILED(hr)) {
-                break;
-            }
-
-            UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
-            if (numFramesAvailable == 0) {
-                continue;
-            }
-
-            // Determine frames to write
-            UINT32 framesToWrite = static_cast<UINT32>(
-                (std::min)(static_cast<size_t>(numFramesAvailable), totalFrames - frameIndex)
-            );
-
-            // Get buffer
-            BYTE* buffer;
-            hr = renderClient->GetBuffer(framesToWrite, &buffer);
-            if (FAILED(hr)) {
-                break;
-            }
-
-            // Copy data
-            size_t byteCount = framesToWrite * mixFormat->nBlockAlign;
-            memcpy(buffer, &audioData[frameIndex * channels], byteCount);
-
-            // Release buffer
-            hr = renderClient->ReleaseBuffer(framesToWrite, 0);
-            if (FAILED(hr)) {
-                break;
-            }
-
-            frameIndex += framesToWrite;
+            if (FAILED(hr)) break;
         }
 
         // Wait for all data to finish playing
@@ -383,14 +372,8 @@ int wmain(int argc, wchar_t* argv[]) {
             // Generate silence buffer
             std::vector<float> silenceData = GenerateSilence(mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
-            // Combine silence and decoded data
-            std::vector<float> finalData;
-            finalData.reserve(silenceData.size() + decodedData.size());
-            finalData.insert(finalData.end(), silenceData.begin(), silenceData.end());
-            finalData.insert(finalData.end(), decodedData.begin(), decodedData.end());
-
-            // Play
-            if (!PlayAudio(finalData, mixFormat)) {
+            // Play with lead-in silence to absorb WASAPI session startup noise and BLE wake-up delay
+            if (!PlayAudio(decodedData, mixFormat, silenceData)) {
                 PrintError("Failed to play audio");
                 exitCode = ERR_PLAYBACK_FAILED;
             }
@@ -400,7 +383,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     // Cleanup
-    if (exitCode != ERR_DECODE_FAILED || exitCode == ERR_WASAPI_INIT) {
+    if (exitCode == ERR_WASAPI_INIT) {
         MFShutdown();
     }
     CoUninitialize();
