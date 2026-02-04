@@ -9,8 +9,8 @@ test.bat
 # Development plan
 .plan.md
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code
+.claude/
 
 # Visual Studio
 .vs/
