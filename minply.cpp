@@ -83,6 +83,146 @@ bool GetDeviceMixFormat(WAVEFORMATEX** mixFormat) {
     return success;
 }
 
+// Read WAV file directly without Media Foundation (bypass resampling for matching formats)
+bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
+                      UINT32 targetSampleRate, UINT32 targetChannels) {
+    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    auto closeFile = [&]() { CloseHandle(hFile); };
+
+    // Read RIFF/WAVE header
+    char header[12];
+    DWORD bytesRead;
+    if (!ReadFile(hFile, header, 12, &bytesRead, nullptr) || bytesRead != 12) {
+        closeFile();
+        return false;
+    }
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
+        closeFile();
+        return false;
+    }
+
+    // Find fmt chunk
+    WAVEFORMATEXTENSIBLE fmt = {};
+    bool fmtFound = false;
+    while (true) {
+        char chunkId[4];
+        DWORD chunkSize;
+        if (!ReadFile(hFile, chunkId, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+        if (!ReadFile(hFile, &chunkSize, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+
+        if (memcmp(chunkId, "fmt ", 4) == 0) {
+            if (chunkSize < 16) break;
+            BYTE fmtBuf[40] = {};
+            DWORD fmtReadSize = (std::min)(chunkSize, static_cast<DWORD>(40));
+            if (!ReadFile(hFile, fmtBuf, fmtReadSize, &bytesRead, nullptr)) break;
+            memcpy(&fmt, fmtBuf, fmtReadSize);
+            fmtFound = true;
+            if (chunkSize > fmtReadSize) {
+                SetFilePointer(hFile, chunkSize - fmtReadSize, nullptr, FILE_CURRENT);
+            }
+            break;
+        }
+        SetFilePointer(hFile, chunkSize, nullptr, FILE_CURRENT);
+    }
+
+    if (!fmtFound) {
+        closeFile();
+        return false;
+    }
+
+    // Normalize format tag
+    WORD actualFormatTag = fmt.Format.wFormatTag;
+    if (actualFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt.Format.cbSize >= 22) {
+        actualFormatTag = *reinterpret_cast<WORD*>(&fmt.SubFormat);
+    }
+
+    // Check format compatibility
+    if (actualFormatTag != WAVE_FORMAT_PCM && actualFormatTag != WAVE_FORMAT_IEEE_FLOAT) {
+        closeFile();
+        return false;
+    }
+    if (fmt.Format.nSamplesPerSec != targetSampleRate || fmt.Format.nChannels != targetChannels) {
+        closeFile();
+        return false;
+    }
+
+    // Find data chunk
+    DWORD dataSize = 0;
+    bool dataFound = false;
+    SetFilePointer(hFile, 12, nullptr, FILE_BEGIN);
+    while (true) {
+        char chunkId[4];
+        DWORD chunkSize;
+        if (!ReadFile(hFile, chunkId, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+        if (!ReadFile(hFile, &chunkSize, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+
+        if (memcmp(chunkId, "data", 4) == 0) {
+            dataSize = chunkSize;
+            dataFound = true;
+            break;
+        }
+        SetFilePointer(hFile, chunkSize, nullptr, FILE_CURRENT);
+    }
+
+    if (!dataFound || dataSize == 0) {
+        closeFile();
+        return false;
+    }
+
+    // Read and convert PCM data to float32
+    UINT32 bytesPerSample = fmt.Format.wBitsPerSample / 8;
+    UINT32 totalSamples = dataSize / bytesPerSample;
+    audioData.resize(totalSamples);
+
+    if (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32) {
+        // float32 WAV - direct read
+        if (!ReadFile(hFile, audioData.data(), dataSize, &bytesRead, nullptr) || bytesRead != dataSize) {
+            closeFile();
+            return false;
+        }
+    } else if (actualFormatTag == WAVE_FORMAT_PCM) {
+        // int PCM - convert to float32
+        std::vector<BYTE> rawData(dataSize);
+        if (!ReadFile(hFile, rawData.data(), dataSize, &bytesRead, nullptr) || bytesRead != dataSize) {
+            closeFile();
+            return false;
+        }
+
+        if (fmt.Format.wBitsPerSample == 16) {
+            // int16 -> float32
+            const int16_t* samples = reinterpret_cast<const int16_t*>(rawData.data());
+            for (UINT32 i = 0; i < totalSamples; i++) {
+                audioData[i] = static_cast<float>(samples[i]) / 32768.0f;
+            }
+        } else if (fmt.Format.wBitsPerSample == 24) {
+            // int24 -> float32
+            for (UINT32 i = 0; i < totalSamples; i++) {
+                int32_t sample = (rawData[i * 3] << 8) | (rawData[i * 3 + 1] << 16) | (rawData[i * 3 + 2] << 24);
+                sample >>= 8; // sign extend
+                audioData[i] = static_cast<float>(sample) / 8388608.0f;
+            }
+        } else if (fmt.Format.wBitsPerSample == 32) {
+            // int32 -> float32
+            const int32_t* samples = reinterpret_cast<const int32_t*>(rawData.data());
+            for (UINT32 i = 0; i < totalSamples; i++) {
+                audioData[i] = static_cast<float>(samples[i]) / 2147483648.0f;
+            }
+        } else {
+            closeFile();
+            return false;
+        }
+    } else {
+        closeFile();
+        return false;
+    }
+
+    closeFile();
+    return true;
+}
+
 // Decode audio file using Media Foundation
 bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
                      UINT32 targetSampleRate, UINT32 targetChannels) {
@@ -362,7 +502,15 @@ int wmain(int argc, wchar_t* argv[]) {
     } else {
         // Decode audio file
         std::vector<float> decodedData;
-        if (!DecodeAudioFile(filePath, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels)) {
+        // Try WAV direct read (bypass MF resampling for matching formats)
+        bool decoded = TryReadWavDirect(filePath, decodedData,
+                                        mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        if (!decoded) {
+            // Fallback to Media Foundation decoder
+            decoded = DecodeAudioFile(filePath, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        }
+
+        if (!decoded) {
             PrintError("Failed to decode audio file");
             exitCode = ERR_DECODE_FAILED;
         } else {
