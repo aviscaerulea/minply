@@ -6,9 +6,10 @@
 
 ## 特徴
 
-- 単一実行ファイル（約 211KB）、ランタイム依存なし
-- MP3, WAV, AAC, FLAC, WMA などの形式に対応（Windows Media Foundation 使用）
+- 単一実行ファイル（約 408KB）、ランタイム依存なし
+- Opus, MP3, WAV, AAC, FLAC, WMA などの形式に対応
 - WAV ファイルは可能な場合リサンプリングなしで直接再生（音質劣化なし）
+- Opus ファイル（.opus, .ogg）の高品質再生対応
 - BLE レシーバの遅延補償のための自動無音再生（0.7 秒）
 - バックグラウンド実行（コンソールウィンドウなし）
 - WASAPI 共有モードでデフォルトオーディオデバイスに再生
@@ -56,11 +57,15 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 
 - [Visual Studio](https://visualstudio.microsoft.com/) 2019 以降（C++ デスクトップ開発ワークロード）
 - [PowerShell 7+](https://github.com/PowerShell/PowerShell)（pwsh）
+- [vcpkg](https://github.com/microsoft/vcpkg)（Opus と Ogg ライブラリ用）
 - [Task](https://taskfile.dev/)（オプション、`task build` を使う場合）
 
 ## ビルド方法
 
 ```powershell
+# vcpkg で依存ライブラリをインストール（初回のみ）
+vcpkg install opus:x64-windows-static libogg:x64-windows-static
+
 # Taskfile を使う場合
 task build
 
@@ -71,7 +76,10 @@ pwsh -ExecutionPolicy Bypass -File build.ps1
 ## 動作の仕組み
 
 1. WASAPI `GetMixFormat` でデフォルトオーディオデバイスのネイティブ形式を取得
-2. WAV ファイルはサンプルレートとチャンネル数が一致すれば直接読み込み、それ以外は Media Foundation でデコード
+2. デコード優先順位：
+   - WAV ファイル：サンプルレートとチャンネル数が一致すれば直接読み込み（音質劣化なし）
+   - Opus ファイル：libopus でデコード（.opus, .ogg 対応）
+   - その他の形式：Media Foundation でデコード（MP3, AAC, FLAC, WMA など）
 3. BLE レシーバのウェイクアップ遅延を補償するため、同一セッション内で 0.7 秒の無音を先行再生
 4. セッション起動時のノイズを無音で吸収した後、続けてオーディオファイルを再生
 

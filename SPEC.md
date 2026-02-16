@@ -2,7 +2,7 @@
 
 ## 概要
 
-minply は Bluetooth Low Energy (BLE) レシーバの音声遅延と先頭欠損を補償する超軽量 CLI オーディオプレイヤー。Windows Media Foundation (WMF) と WASAPI を使用し、単一実行ファイル（約 212KB）として動作する。
+minply は Bluetooth Low Energy (BLE) レシーバの音声遅延と先頭欠損を補償する超軽量 CLI オーディオプレイヤー。Windows Media Foundation (WMF), libopus, WASAPI を使用し、単一実行ファイル（約 408KB）として動作する。
 
 ## 技術スタック
 
@@ -11,6 +11,11 @@ minply は Bluetooth Low Energy (BLE) レシーバの音声遅延と先頭欠損
 - **Windows Media Foundation (WMF)**: オーディオデコード
   - `mfplat.lib`, `mfreadwrite.lib`, `mfuuid.lib`
   - MP3, AAC, FLAC, WMA など多様な形式に対応
+- **libopus**: Opus オーディオコーデックのデコード
+  - `opus.lib` (vcpkg: opus:x64-windows-static)
+  - Opus 形式（.opus, .ogg）に対応
+- **libogg**: Ogg コンテナフォーマットのパース
+  - `ogg.lib` (vcpkg: libogg:x64-windows-static)
 - **WASAPI (Windows Audio Session API)**: オーディオ出力
   - イベント駆動共有モード
   - デフォルトオーディオデバイスへの再生
@@ -21,6 +26,7 @@ minply は Bluetooth Low Energy (BLE) レシーバの音声遅延と先頭欠損
 - 言語: C++
 - コンパイラ: Visual Studio 2019 以降（C++ デスクトップ開発ワークロード）
 - ビルドツール: PowerShell 7+, Task
+- パッケージマネージャ: vcpkg
 - ターゲット: Windows 10 version 1607 以降（x64）
 
 ## アーキテクチャ
@@ -35,6 +41,7 @@ minply は Bluetooth Low Energy (BLE) レシーバの音声遅延と先頭欠損
 5. WASAPI デバイスのミックスフォーマット取得
 6. オーディオファイルデコード
    ├─ WAV 直接読み込み試行（TryReadWavDirect）
+   ├─ Opus デコード試行（TryDecodeOpusFile）
    └─ 失敗時は MF デコード（DecodeAudioFile）
 7. フェードイン/アウト適用（ApplyFade）
 8. 無音バッファ生成（GenerateSilence）
@@ -226,7 +233,65 @@ UINT32 framesToWrite = (std::min)(numFramesAvailable, totalFrames - frameIndex);
 - オーディオデータは `std::vector<float>` で管理
 - デコード後は即座に MF をシャットダウンしてメモリ解放
 
+## Opus デコード機構
+
+### 目的
+
+Opus は低遅延・高音質を特徴とする音声コーデックで、通知音やVoIP アプリケーションで広く使用される。Windows Media Foundation では Opus 対応が限定的（Windows 11 22H2 以降の一部環境のみ）であるため、libopus を静的リンクして確実な対応を実現する。
+
+### 対応コンテナ
+
+- `.opus` ファイル（Ogg Opus コンテナ）
+- `.ogg` ファイル（Opus コーデックのみ対応、Vorbis は非対応）
+
+### 実装
+
+```cpp
+bool TryDecodeOpusFile(const wchar_t* filePath, std::vector<float>& audioData,
+                       UINT32 targetSampleRate, UINT32 targetChannels)
+```
+
+#### 処理フロー
+
+1. **Ogg コンテナパース**
+   - libogg でページ単位にデータを読み込み
+   - ストリームの初期化とシリアル番号の取得
+
+2. **OpusHead パケット解析**
+   - 最初のパケットから Opus ストリームの識別
+   - チャンネル数などのメタデータを取得
+   - Opus デコーダを 48kHz で初期化（Opus ネイティブレート）
+
+3. **オーディオパケットデコード**
+   - opus_decode_float() で PCM float32 に変換
+   - 全パケットをデコードしてバッファに蓄積
+
+4. **フォーマット変換**
+   - ConvertFormat() でサンプルレート変換（48kHz → デバイスレート）
+   - チャンネル数変換（必要に応じてモノラル↔ステレオ）
+
+#### リサンプリング
+
+簡易リニアLaTeX 補間によるリサンプリングを実装：
+- 通知音は短時間（数秒以下）のため、高品質なリサンプラーは不要
+- デバイスが 48kHz の場合はリサンプリング不要（Opus ネイティブ）
+
+#### エラーハンドリング
+
+- Opus ファイルでない場合は `false` を返し、Media Foundation にフォールバック
+- デコードエラーも同様にフォールバックで対処
+
+### 効果
+
+- Windows 10 1607 以降で確実に Opus 再生が可能
+- ファイルサイズ増加約 197KB（211KB → 408KB）
+- 環境依存なし（静的リンク）
+
 ## 対応フォーマット
+
+### libopus 経由
+
+- Opus (.opus, .ogg)
 
 ### Windows Media Foundation 経由
 

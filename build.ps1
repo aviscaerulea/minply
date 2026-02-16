@@ -3,6 +3,11 @@
 
 $ErrorActionPreference = "Stop"
 
+# vcpkg パス設定
+$vcpkgRoot = "C:\vcpkg"
+$vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
+$vcpkgLib = "$vcpkgRoot\installed\x64-windows-static\lib"
+
 # Visual Studio 開発環境を有効化
 Enable-VSDev -Arch amd64
 
@@ -15,7 +20,12 @@ Write-Host ""
 Write-Host "Compiling minply.cpp..." -ForegroundColor Cyan
 
 # コンパイル実行（ログを out/build.log に保存）
-cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /Fo:out/ /Fe:out/minply.exe minply.cpp ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -FilePath "out/build.log"
+cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
+   /I"$vcpkgInclude" `
+   /Fo:out/ /Fe:out/minply.exe minply.cpp `
+   ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib `
+   "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" `
+   /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -FilePath "out/build.log"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red

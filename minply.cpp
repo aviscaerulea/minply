@@ -7,12 +7,14 @@
  *   minply.exe <audio file path>
  *
  * Features:
- *   - Instantly plays MP3, WAV, AAC, FLAC and other audio files
+ *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
  *   - Plays 0.7 seconds of silence before audio playback (BLE lag compensation)
  *   - Exits immediately after playback completes
  *
  * Dependencies:
  *   - Windows Media Foundation: Audio decoder
+ *   - libopus: Opus audio codec decoder
+ *   - libogg: Ogg container format parser
  *   - WASAPI: Windows audio output
  *
  * Build:
@@ -28,11 +30,14 @@
 #include <mferror.h>
 #include <iostream>
 #include <vector>
+#include <ogg/ogg.h>
+#include <opus/opus.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
+// Note: opus.lib and ogg.lib are linked via build.ps1
 
 // Error codes
 #define EXIT_SUCCESS          0
@@ -222,6 +227,145 @@ bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
     }
 
     closeFile();
+    return true;
+}
+
+// Check if file is Opus format
+bool IsOpusFile(const wchar_t* filePath) {
+    const wchar_t* ext = wcsrchr(filePath, L'.');
+    if (!ext) return false;
+    return (_wcsicmp(ext, L".opus") == 0 || _wcsicmp(ext, L".ogg") == 0);
+}
+
+// Convert audio format (resampling and channel conversion)
+std::vector<float> ConvertFormat(const std::vector<float>& input,
+                                 UINT32 srcRate, UINT32 srcChannels,
+                                 UINT32 dstRate, UINT32 dstChannels) {
+    if (input.empty() || srcRate == 0 || dstRate == 0 || srcChannels == 0 || dstChannels == 0) {
+        return {};
+    }
+    if (srcRate == dstRate && srcChannels == dstChannels) {
+        return input;
+    }
+
+    size_t srcFrames = input.size() / srcChannels;
+    size_t dstFrames = static_cast<size_t>((static_cast<uint64_t>(srcFrames) * dstRate) / srcRate);
+    std::vector<float> output(dstFrames * dstChannels);
+
+    for (size_t i = 0; i < dstFrames; i++) {
+        float srcIndex = static_cast<float>(i * srcRate) / dstRate;
+        size_t idx0 = static_cast<size_t>(srcIndex);
+        size_t idx1 = (std::min)(idx0 + 1, srcFrames - 1);
+        float frac = srcIndex - idx0;
+
+        for (UINT32 ch = 0; ch < dstChannels; ch++) {
+            UINT32 srcCh = (std::min)(ch, srcChannels - 1);
+            float s0 = input[idx0 * srcChannels + srcCh];
+            float s1 = input[idx1 * srcChannels + srcCh];
+            output[i * dstChannels + ch] = s0 + (s1 - s0) * frac;
+        }
+    }
+
+    return output;
+}
+
+// Decode Opus file (.opus and .ogg Opus)
+bool TryDecodeOpusFile(const wchar_t* filePath, std::vector<float>& audioData,
+                       UINT32 targetSampleRate, UINT32 targetChannels) {
+    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    auto closeFile = [&]() { CloseHandle(hFile); };
+
+    ogg_sync_state   oy;
+    ogg_stream_state os;
+    ogg_page         og;
+    ogg_packet       op;
+
+    ogg_sync_init(&oy);
+    bool streamInitialized = false;
+    OpusDecoder* decoder = nullptr;
+    int opusChannels = 0;
+    const int opusSampleRate = 48000;
+    std::vector<float> decodedFloat;
+    int packetCount = 0;
+
+    const size_t CHUNK_SIZE = 4096;
+    bool success = false;
+
+    // Opus stream structure: packet 1 = OpusHead, packet 2 = OpusTags, packet 3+ = audio data
+    while (true) {
+        char* buffer = ogg_sync_buffer(&oy, CHUNK_SIZE);
+        if (!buffer) break;
+        DWORD bytesRead;
+        if (!ReadFile(hFile, buffer, CHUNK_SIZE, &bytesRead, nullptr) || bytesRead == 0) {
+            break;
+        }
+        ogg_sync_wrote(&oy, bytesRead);
+
+        while (ogg_sync_pageout(&oy, &og) == 1) {
+            if (!streamInitialized) {
+                ogg_stream_init(&os, ogg_page_serialno(&og));
+                streamInitialized = true;
+            }
+            ogg_stream_pagein(&os, &og);
+
+            while (ogg_stream_packetout(&os, &op) == 1) {
+                packetCount++;
+
+                if (packetCount == 1) {
+                    // OpusHead packet (format and channel information)
+                    if (op.bytes >= 19 && memcmp(op.packet, "OpusHead", 8) == 0) {
+                        opusChannels = op.packet[9];
+                        int error;
+                        decoder = opus_decoder_create(opusSampleRate, opusChannels, &error);
+                        if (error != OPUS_OK || !decoder) {
+                            closeFile();
+                            if (streamInitialized) ogg_stream_clear(&os);
+                            ogg_sync_clear(&oy);
+                            return false;
+                        }
+                    } else {
+                        // Not an Opus file
+                        closeFile();
+                        if (decoder) opus_decoder_destroy(decoder);
+                        if (streamInitialized) ogg_stream_clear(&os);
+                        ogg_sync_clear(&oy);
+                        return false;
+                    }
+                } else if (packetCount == 2) {
+                    // OpusTags packet (metadata, skip)
+                    continue;
+                } else {
+                    // Audio packet
+                    if (decoder) {
+                        const int MAX_FRAME_SIZE = 5760;  // 120ms at 48kHz
+                        float pcmBuffer[MAX_FRAME_SIZE * 8];  // Support up to 8 channels
+                        int frameSize = opus_decode_float(decoder, op.packet, op.bytes,
+                                                          pcmBuffer, MAX_FRAME_SIZE, 0);
+                        if (frameSize > 0) {
+                            size_t sampleCount = static_cast<size_t>(frameSize) * opusChannels;
+                            decodedFloat.insert(decodedFloat.end(), pcmBuffer, pcmBuffer + sampleCount);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    closeFile();
+
+    if (decoder) opus_decoder_destroy(decoder);
+    if (streamInitialized) ogg_stream_clear(&os);
+    ogg_sync_clear(&oy);
+
+    if (decodedFloat.empty()) return false;
+
+    // Format conversion
+    audioData = ConvertFormat(decodedFloat, opusSampleRate, opusChannels,
+                              targetSampleRate, targetChannels);
+
     return true;
 }
 
@@ -531,6 +675,11 @@ int wmain(int argc, wchar_t* argv[]) {
         // Try WAV direct read (bypass MF resampling for matching formats)
         bool decoded = TryReadWavDirect(filePath, decodedData,
                                         mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        if (!decoded && IsOpusFile(filePath)) {
+            // Try Opus decode
+            decoded = TryDecodeOpusFile(filePath, decodedData,
+                                        mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        }
         if (!decoded) {
             // Fallback to Media Foundation decoder
             decoded = DecodeAudioFile(filePath, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
