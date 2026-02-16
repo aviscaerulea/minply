@@ -34,7 +34,7 @@
 
 ### リリース手順
 
-- アセット命名: `minply-{version}-windows-x86_64.zip`（exe のみ同梱）
+- アセット命名: `minply-{version}-x64.zip`（exe のみ同梱）
 - リリースノート: 日本語、`## 変更点` → `### {カテゴリ}` の構造
 - バージョニング: 機能追加は minor、バグ修正は patch
 
