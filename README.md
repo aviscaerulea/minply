@@ -86,6 +86,15 @@ pwsh -ExecutionPolicy Bypass -File build.ps1
 3. BLE レシーバの省電力モード移行を防ぐため、冒頭 1.5 秒・末尾 2.0 秒に不可聴の 19kHz ガードトーンを再生
 4. ガードトーンでレシーバを起床・維持し、続けてオーディオファイルを再生
 
+## リリース
+
+`v*` パターンのタグを push すると、GitHub Actions が自動的にリリースビルドを実行し、GitHub Release を作成する。
+
+```bash
+git tag v1.4.0
+git push origin v1.4.0
+```
+
 ## ライセンス
 
 MIT

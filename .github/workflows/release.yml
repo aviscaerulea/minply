@@ -1,0 +1,32 @@
+# vim: set ft=yaml fenc=utf-8 ff=unix sw=2 ts=2 et :
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install vcpkg dependencies
+        run: vcpkg install opus:x64-windows-static libogg:x64-windows-static
+
+      - name: Build
+        run: pwsh -ExecutionPolicy Bypass -File build.ps1
+
+      - name: Package
+        run: Compress-Archive -Path out/minply.exe -DestinationPath "minply-${{ github.ref_name }}-x64.zip"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: minply-${{ github.ref_name }}-x64.zip
+          generate_release_notes: true
