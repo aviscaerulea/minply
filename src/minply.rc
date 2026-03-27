@@ -1,4 +1,4 @@
 // vim: set ft=rc fenc=utf-8 ff=unix :
 // minply リソーススクリプト
 // ID 1 はエクスプローラーが参照するアプリケーションアイコンの標準 ID
-1 ICON "app.ico"
+1 ICON "src/app.ico"
