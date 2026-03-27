@@ -1,6 +1,20 @@
+# vim: set ft=yaml fenc=utf-8 ff=unix sw=2 ts=2 et :
+# https://taskfile.dev
+$schema: https://taskfile.dev/schema.json
 version: '3'
 
+vars:
+  VERSION:
+    sh: git describe --tags --always --dirty
+  OUT_DIR: '{{.OUT_DIR | default "out"}}'
+
 tasks:
+  default:
+    desc: クリーンビルドを実行する
+    cmds:
+      - task: clean
+      - task: build
+
   setup:
     desc: vcpkg で依存ライブラリをインストール
     status:
@@ -8,24 +22,30 @@ tasks:
     cmds:
       - vcpkg install opus:x64-windows-static libogg:x64-windows-static
 
+  clean:
+    desc: ビルド成果物を削除してクリーニングする
+    preconditions:
+      - sh: '[ "{{.OUT_DIR}}" != "" ] && [ "{{.OUT_DIR}}" != "/" ]'
+        msg: "OUT_DIR が空、またはルートディレクトリである。"
+    cmds:
+      - rm -rf {{.OUT_DIR}}
+      - mkdir -p {{.OUT_DIR}}
+
   build:
     desc: minply をビルド
     deps: [setup]
     cmds:
       - pwsh -ExecutionPolicy Bypass -File build.ps1
 
-  clean:
-    desc: ビルド成果物を削除
+  release:
+    desc: リリースビルドを行い zip に圧縮する（exe のみ同梱）
+    deps: [clean]
     cmds:
-      - pwsh -Command "Remove-Item -Recurse -Force out -ErrorAction SilentlyContinue"
+      - task: build
+      - pwsh -Command "Compress-Archive -Path {{.OUT_DIR}}/minply.exe -DestinationPath minply-{{.VERSION}}-x64.zip -Force"
 
   run:
     desc: test.mp3 を再生
     deps: [build]
     cmds:
-      - ./out/minply.exe test.mp3
-
-  default:
-    desc: デフォルトタスク（ビルド）
-    cmds:
-      - task build
+      - ./{{.OUT_DIR}}/minply.exe test.mp3

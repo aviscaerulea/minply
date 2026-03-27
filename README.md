@@ -66,8 +66,11 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 # vcpkg で依存ライブラリをインストール（初回のみ）
 vcpkg install opus:x64-windows-static libogg:x64-windows-static
 
-# Taskfile を使う場合
+# 通常ビルド
 task build
+
+# リリースビルド（クリーンビルド → exe を zip に圧縮）
+task release
 
 # PowerShell で直接実行する場合
 pwsh -ExecutionPolicy Bypass -File build.ps1
