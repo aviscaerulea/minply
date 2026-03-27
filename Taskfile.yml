@@ -1,8 +1,16 @@
 version: '3'
 
 tasks:
+  setup:
+    desc: vcpkg で依存ライブラリをインストール
+    status:
+      - vcpkg list | grep -q "opus:x64-windows-static"
+    cmds:
+      - vcpkg install opus:x64-windows-static libogg:x64-windows-static
+
   build:
     desc: minply をビルド
+    deps: [setup]
     cmds:
       - pwsh -ExecutionPolicy Bypass -File build.ps1
 

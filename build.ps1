@@ -3,29 +3,55 @@
 
 $ErrorActionPreference = "Stop"
 
-# vcpkg パス設定
-$vcpkgRoot = "C:\vcpkg"
+# vcpkg パス設定（Scoop シム経由インストールに対応）
+$vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
+$shimFile = [System.IO.Path]::ChangeExtension($vcpkgCmd, ".shim")
+if (Test-Path $shimFile) {
+    # Scoop のシムファイルから実体パスを取得
+    $vcpkgReal = (Get-Content $shimFile |
+        Where-Object { $_ -match "^path" } |
+        ForEach-Object { ($_ -split '"')[1] } |
+        Select-Object -First 1)
+    $vcpkgRoot = Split-Path $vcpkgReal
+}
+else {
+    $vcpkgRoot = Split-Path $vcpkgCmd
+}
 $vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
 $vcpkgLib = "$vcpkgRoot\installed\x64-windows-static\lib"
 
-# Visual Studio 開発環境を有効化
-Enable-VSDev -Arch amd64
+# VS 開発環境をロード（公式 DLL モジュール方式、Build Tools 対応）
+$vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+$vsPath = & $vswhere -products '*' -latest -property installationPath
+if (-not $vsPath) { Write-Error "Visual Studio / Build Tools が見つからない"; exit 1 }
+
+$devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+if (-not (Test-Path $devShellDll)) { Write-Error "DevShell.dll が見つからない: $devShellDll"; exit 1 }
+Import-Module $devShellDll
+Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
 # 出力ディレクトリ作成
 if (-not (Test-Path "out")) {
     New-Item -ItemType Directory -Path "out" | Out-Null
 }
 
-Write-Host ""
+Write-Host "Compiling resources..." -ForegroundColor Cyan
+
+rc /nologo /fo out\minply.res minply.rc 2>&1 | Tee-Object -FilePath "out/build.log"
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "Resource compile failed" -ForegroundColor Red
+    exit 1
+}
+
 Write-Host "Compiling minply.cpp..." -ForegroundColor Cyan
 
-# コンパイル実行（ログを out/build.log に保存）
+# コンパイル実行（ログを out/build.log に追記）
 cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
    /I"$vcpkgInclude" `
-   /Fo:out/ /Fe:out/minply.exe minply.cpp `
+   /Fo:out/ /Fe:out/minply.exe minply.cpp out\minply.res `
    ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib `
    "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" `
-   /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -FilePath "out/build.log"
+   /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -Append -FilePath "out/build.log"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red

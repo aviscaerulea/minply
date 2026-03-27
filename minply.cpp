@@ -8,7 +8,7 @@
  *
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
- *   - Plays 0.7 seconds of silence before audio playback (BLE lag compensation)
+ *   - Plays inaudible 19kHz guard tone before/after audio (BLE anti-clipping)
  *   - Exits immediately after playback completes
  *
  * Dependencies:
@@ -48,7 +48,12 @@
 #define ERR_PLAYBACK_FAILED   5
 
 // Constants
-constexpr float SILENCE_DURATION = 0.7f;  // Silence duration in seconds (BLE lag compensation)
+constexpr float LEAD_IN_DURATION = 1.5f;    // Lead-in duration in seconds; 0.7s for BLE wake-up + margin for WASAPI session startup noise
+constexpr float LEAD_OUT_DURATION = 2.0f;   // Lead-out duration in seconds; longer than lead-in to allow audio tail to drain through BLE/SBC codec pipeline
+constexpr float BLE_GUARD_FREQ = 19000.0f;  // Guard tone frequency in Hz (inaudible to adults)
+constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
+constexpr float TWO_PI = 6.2831853f;        // 2π
+
 constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 constexpr DWORD DRAIN_WAIT_MS = 300;       // Wait time for device buffer drain in milliseconds
@@ -454,10 +459,22 @@ bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
     return success;
 }
 
-// Generate silence buffer
-std::vector<float> GenerateSilence(UINT32 sampleRate, UINT32 channels) {
-    size_t silenceSamples = static_cast<size_t>(sampleRate * SILENCE_DURATION * channels);
-    return std::vector<float>(silenceSamples, 0.0f);
+// Generate inaudible 19kHz sine wave buffer for BLE anti-clipping
+// BLE devices enter power-saving mode on digital silence, causing audio clipping.
+// A 19kHz tone at ~-60dB is inaudible to adults but keeps the BLE codec active.
+std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float duration) {
+    size_t totalFrames = static_cast<size_t>(sampleRate * duration);
+    std::vector<float> buffer(totalFrames * channels);
+
+    for (size_t i = 0; i < totalFrames; i++) {
+        float t = static_cast<float>(i) / sampleRate;
+        float sample = BLE_GUARD_AMP * sinf(TWO_PI * BLE_GUARD_FREQ * t);
+        for (UINT32 ch = 0; ch < channels; ch++) {
+            buffer[i * channels + ch] = sample;
+        }
+    }
+
+    return buffer;
 }
 
 // Apply fade-in/out to audio data to prevent click noise from waveform discontinuity
@@ -486,7 +503,8 @@ void ApplyFade(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels
 
 // Play audio using WASAPI
 bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
-               const std::vector<float>& leadIn = {}) {
+               const std::vector<float>& leadIn = {},
+               const std::vector<float>& leadOut = {}) {
     HRESULT hr;
     IMMDeviceEnumerator* deviceEnumerator = nullptr;
     IMMDevice* device = nullptr;
@@ -565,8 +583,8 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Play lead-in data (silence for BLE wake-up), then main audio data
-        const std::vector<float>* sources[] = { &leadIn, &audioData };
+        // Play lead-in (BLE guard), main audio, then lead-out (BLE guard)
+        const std::vector<float>* sources[] = { &leadIn, &audioData, &leadOut };
         for (const auto* source : sources) {
             if (source->empty()) continue;
 
@@ -695,11 +713,14 @@ int wmain(int argc, wchar_t* argv[]) {
             // Apply fade to prevent click noise
             ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
-            // Generate silence buffer
-            std::vector<float> silenceData = GenerateSilence(mixFormat->nSamplesPerSec, mixFormat->nChannels);
+            // Generate BLE guard tone buffers
+            std::vector<float> leadIn = GenerateBleGuard(
+                mixFormat->nSamplesPerSec, mixFormat->nChannels, LEAD_IN_DURATION);
+            std::vector<float> leadOut = GenerateBleGuard(
+                mixFormat->nSamplesPerSec, mixFormat->nChannels, LEAD_OUT_DURATION);
 
-            // Play with lead-in silence to absorb WASAPI session startup noise and BLE wake-up delay
-            if (!PlayAudio(decodedData, mixFormat, silenceData)) {
+            // Play with BLE guard tones to prevent BLE device from entering power-saving mode
+            if (!PlayAudio(decodedData, mixFormat, leadIn, leadOut)) {
                 PrintError("Failed to play audio");
                 exitCode = ERR_PLAYBACK_FAILED;
             }

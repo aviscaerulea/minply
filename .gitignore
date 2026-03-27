@@ -1,5 +1,7 @@
 # Build artifacts
 out/
+*.exe
+*.zip
 
 # Test files
 *.mp3
