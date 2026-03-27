@@ -37,18 +37,18 @@ if (-not (Test-Path "out")) {
 
 Write-Host "Compiling resources..." -ForegroundColor Cyan
 
-rc /nologo /fo out\minply.res minply.rc 2>&1 | Tee-Object -FilePath "out/build.log"
+rc /nologo /fo out\minply.res src\minply.rc 2>&1 | Tee-Object -FilePath "out/build.log"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Resource compile failed" -ForegroundColor Red
     exit 1
 }
 
-Write-Host "Compiling minply.cpp..." -ForegroundColor Cyan
+Write-Host "Compiling src\minply.cpp..." -ForegroundColor Cyan
 
 # コンパイル実行（ログを out/build.log に追記）
 cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
    /I"$vcpkgInclude" `
-   /Fo:out/ /Fe:out/minply.exe minply.cpp out\minply.res `
+   /Fo:out/ /Fe:out/minply.exe src\minply.cpp out\minply.res `
    ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib `
    "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" `
    /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -Append -FilePath "out/build.log"
