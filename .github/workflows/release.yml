@@ -32,4 +32,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: minply-${{ github.ref_name }}-x64.zip
-          generate_release_notes: true
