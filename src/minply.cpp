@@ -95,6 +95,11 @@ bool GetDeviceMixFormat(WAVEFORMATEX** mixFormat) {
     return success;
 }
 
+// Forward declaration
+std::vector<float> ConvertFormat(const std::vector<float>& input,
+                                 UINT32 srcRate, UINT32 srcChannels,
+                                 UINT32 dstRate, UINT32 dstChannels);
+
 // Read WAV file directly without Media Foundation (bypass resampling for matching formats)
 bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
                       UINT32 targetSampleRate, UINT32 targetChannels) {
@@ -156,7 +161,7 @@ bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
         closeFile();
         return false;
     }
-    if (fmt.Format.nSamplesPerSec != targetSampleRate || fmt.Format.nChannels != targetChannels) {
+    if (fmt.Format.nSamplesPerSec != targetSampleRate) {
         closeFile();
         return false;
     }
@@ -232,6 +237,13 @@ bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
     }
 
     closeFile();
+
+    // Channel conversion (e.g. mono -> stereo)
+    if (fmt.Format.nChannels != targetChannels) {
+        audioData = ConvertFormat(audioData, targetSampleRate, fmt.Format.nChannels,
+                                  targetSampleRate, targetChannels);
+    }
+
     return true;
 }
 
