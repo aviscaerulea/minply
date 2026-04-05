@@ -2,6 +2,7 @@
 # Visual Studio の開発環境を pwsh で有効化してコンパイルを実行
 
 $ErrorActionPreference = "Stop"
+Set-Location $PSScriptRoot
 
 # vcpkg パス設定（Scoop シム経由インストールに対応）
 $vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
@@ -20,13 +21,12 @@ else {
 $vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
 $vcpkgLib = "$vcpkgRoot\installed\x64-windows-static\lib"
 
-# VS 開発環境をロード（公式 DLL モジュール方式、Build Tools 対応）
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe が見つからない: $vswhere"; exit 1 }
 $vsPath = & $vswhere -products '*' -latest -property installationPath
 if (-not $vsPath) { Write-Error "Visual Studio / Build Tools が見つからない"; exit 1 }
 
 $devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-if (-not (Test-Path $devShellDll)) { Write-Error "DevShell.dll が見つからない: $devShellDll"; exit 1 }
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
