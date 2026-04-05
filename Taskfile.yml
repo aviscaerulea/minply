@@ -49,3 +49,12 @@ tasks:
     deps: [build]
     cmds:
       - ./{{.OUT_DIR}}/minply.exe test.mp3
+
+  rebuild:
+    desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
+    cmds:
+      - cmd: taskkill /F /IM minply.exe
+        ignore_error: true
+      - task: clean
+      - task: build
+      - ./{{.OUT_DIR}}/minply.exe out/test.mp3
