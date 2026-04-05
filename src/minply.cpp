@@ -48,8 +48,8 @@
 #define ERR_PLAYBACK_FAILED   5
 
 // Constants
-constexpr float LEAD_IN_DURATION = 1.5f;    // Lead-in duration in seconds; 0.7s for BLE wake-up + margin for WASAPI session startup noise
-constexpr float LEAD_OUT_DURATION = 2.0f;   // Lead-out duration in seconds; longer than lead-in to allow audio tail to drain through BLE/SBC codec pipeline
+constexpr float LEAD_IN_DURATION = 1.2f;    // Lead-in duration in seconds; BLE wake-up (~700ms) + WASAPI session startup noise margin
+constexpr float LEAD_OUT_DURATION = 1.2f;   // Lead-out duration in seconds; keep BLE active until audio tail drains through SBC codec pipeline
 constexpr float BLE_GUARD_FREQ = 19000.0f;  // Guard tone frequency in Hz (inaudible to adults)
 constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
 constexpr float TWO_PI = 6.2831853f;        // 2π
