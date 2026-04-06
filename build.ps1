@@ -8,7 +8,6 @@ Set-Location $PSScriptRoot
 $vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
 $shimFile = [System.IO.Path]::ChangeExtension($vcpkgCmd, ".shim")
 if (Test-Path $shimFile) {
-    # Scoop のシムファイルから実体パスを取得
     $vcpkgReal = (Get-Content $shimFile |
         Where-Object { $_ -match "^path" } |
         ForEach-Object { ($_ -split '"')[1] } |
@@ -30,10 +29,7 @@ $devShellDll = Join-Path $vsPath "Common7\Tools\Microsoft.VisualStudio.DevShell.
 Import-Module $devShellDll
 Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
 
-# 出力ディレクトリ作成
-if (-not (Test-Path "out")) {
-    New-Item -ItemType Directory -Path "out" | Out-Null
-}
+New-Item -ItemType Directory -Path "out" -Force | Out-Null
 
 Write-Host "Compiling resources..." -ForegroundColor Cyan
 
@@ -45,7 +41,6 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host "Compiling src\minply.cpp..." -ForegroundColor Cyan
 
-# コンパイル実行（ログを out/build.log に追記）
 cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
    /I"$vcpkgInclude" `
    /Fo:out/ /Fe:out/minply.exe src\minply.cpp out\minply.res `
