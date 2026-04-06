@@ -1,8 +1,6 @@
 # minply
 
-**Bluetooth レシーバの先頭欠損を自動補償する、超軽量 CLI オーディオプレイヤー**
-
-通知音などの短い音声を高速軽量に再生するための Windows 用オーディオプレイヤー。
+BLE レシーバの先頭欠損を防止する、通知音など再生用の超軽量 CLI オーディオプレイヤー。
 
 ## 機能
 
@@ -43,9 +41,6 @@ minply.exe notification.mp3
 
 # WAV ファイルを再生
 minply.exe alert.wav
-
-# 他のコマンドと連携
-minply.exe done.mp3 && echo "再生完了"
 
 # エラー出力をキャプチャ
 minply.exe notfound.mp3 2>&1 | Out-File error.log
