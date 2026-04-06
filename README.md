@@ -74,6 +74,3 @@ task build
 pwsh -ExecutionPolicy Bypass -File build.ps1
 ```
 
-## ライセンス
-
-MIT
