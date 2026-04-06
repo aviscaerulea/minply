@@ -4,7 +4,7 @@
 
 通知音などの短い音声を高速軽量に再生するための Windows 用オーディオプレイヤー。
 
-## 特徴
+## 機能
 
 - 単一実行ファイル（約 408KB）、ランタイム依存なし
 - Opus, MP3, WAV, AAC, FLAC, WMA などの形式に対応
@@ -15,7 +15,23 @@
 - WASAPI 共有モードでデフォルトオーディオデバイスに再生
 - 再生完了後に即座に終了
 
-## 使い方
+## 動作要件
+
+### 実行
+
+- Windows 10 version 1607 以降（x64）
+- 追加のソフトウェアは不要（全ての依存関係は Windows に組み込み済み）
+
+## インストール方法
+
+[Scoop](https://scoop.sh/) でインストールできる。
+
+```powershell
+scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
+scoop install minply
+```
+
+## 使用方法
 
 ```
 minply.exe <オーディオファイル>
@@ -35,7 +51,7 @@ minply.exe done.mp3 && echo "再生完了"
 minply.exe notfound.mp3 2>&1 | Out-File error.log
 ```
 
-## 終了コード
+### 終了コード
 
 | コード | 説明 |
 |------|------|
@@ -46,53 +62,16 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 | 4 | オーディオデバイスの初期化失敗 |
 | 5 | 再生失敗 |
 
-## 動作要件
-
-### 実行
-
-- Windows 10 version 1607 以降（x64）
-- 追加のソフトウェアは不要（全ての依存関係は Windows に組み込み済み）
-
-### ビルド
-
-- [Visual Studio](https://visualstudio.microsoft.com/) 2019 以降（C++ デスクトップ開発ワークロード）
-- [PowerShell 7+](https://github.com/PowerShell/PowerShell)（pwsh）
-- [vcpkg](https://github.com/microsoft/vcpkg)（Opus と Ogg ライブラリ用）
-- [Task](https://taskfile.dev/)（オプション、`task build` を使う場合）
-
 ## ビルド方法
 
-```powershell
-# vcpkg で依存ライブラリをインストール（初回のみ）
-vcpkg install opus:x64-windows-static libogg:x64-windows-static
+vcpkg の依存ライブラリは `task build` 実行時に自動インストールされる。
 
-# 通常ビルド
+```powershell
+# 通常ビルド（依存ライブラリの自動インストール含む）
 task build
 
-# リリースビルド（クリーンビルド → exe を zip に圧縮）
-task release
-
-# PowerShell で直接実行する場合
+# PowerShell で直接ビルドする場合（事前に vcpkg install が必要）
 pwsh -ExecutionPolicy Bypass -File build.ps1
-```
-
-## 動作の仕組み
-
-1. WASAPI `GetMixFormat` でデフォルトオーディオデバイスのネイティブ形式を取得
-2. デコード優先順位：
-   - WAV ファイル：サンプルレートが一致すれば直接読み込み（音質劣化なし、チャンネル変換は自動）
-   - Opus ファイル：libopus でデコード（.opus, .ogg 対応）
-   - その他の形式：Media Foundation でデコード（MP3, AAC, FLAC, WMA など）
-3. BLE レシーバの省電力モード移行を防ぐため、冒頭 1.2 秒・末尾 1.2 秒に不可聴の 19kHz ガードトーンを再生
-4. ガードトーンでレシーバを起床・維持し、続けてオーディオファイルを再生
-
-## リリース
-
-`v*` パターンのタグを push すると、GitHub Actions が自動的にリリースビルドを実行し、GitHub Release を作成する。
-
-```bash
-git tag v1.4.0
-git push origin v1.4.0
 ```
 
 ## ライセンス
