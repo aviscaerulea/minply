@@ -45,7 +45,7 @@ cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
    /I"$vcpkgInclude" `
    /Fo:out/ /Fe:out/minply.exe src\minply.cpp out\minply.res `
    ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib `
-   "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" `
+   "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" "$vcpkgLib\ebur128.lib" `
    /link /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup 2>&1 | Tee-Object -Append -FilePath "out/build.log"
 
 if ($LASTEXITCODE -ne 0) {

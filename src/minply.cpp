@@ -32,6 +32,8 @@
 #include <vector>
 #include <ogg/ogg.h>
 #include <opus/opus.h>
+#include <ebur128.h>
+#include <cmath>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -53,6 +55,10 @@ constexpr float LEAD_OUT_DURATION = 1.2f;   // Lead-out duration in seconds; kee
 constexpr float BLE_GUARD_FREQ = 19000.0f;  // Guard tone frequency in Hz (inaudible to adults)
 constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
 constexpr float TWO_PI = 6.2831853f;        // 2π
+
+constexpr float LOUDNESS_TARGET = -6.0f;         // Target integrated loudness in LUFS (optimized for notification sounds)
+constexpr float LOUDNESS_PEAK_CEILING = 0.891f;  // True peak ceiling (-1dBFS); prevents clipping after loudness gain
+constexpr float LOUDNESS_MIN_PEAK = 1e-6f;       // Minimum peak threshold; skip normalization for near-silence
 
 constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
@@ -489,6 +495,43 @@ std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float du
     return buffer;
 }
 
+// Normalize audio to LOUDNESS_TARGET using EBU R128 integrated loudness (ITU-R BS.1770-4)
+//
+// Measures integrated loudness via libebur128, computes gain to reach LOUDNESS_TARGET,
+// then clamps gain if true peak would exceed LOUDNESS_PEAK_CEILING.
+void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels) {
+    if (audioData.empty()) return;
+
+    float peak = 0.0f;
+    for (float s : audioData) {
+        float v = fabsf(s);
+        if (v > peak) peak = v;
+    }
+    if (peak < LOUDNESS_MIN_PEAK) return;
+
+    ebur128_state* state = ebur128_init(channels, sampleRate, EBUR128_MODE_I);
+    if (!state) return;
+
+    size_t frames = audioData.size() / channels;
+    ebur128_add_frames_float(state, audioData.data(), frames);
+
+    double loudness = 0.0;
+    int result = ebur128_loudness_global(state, &loudness);
+    ebur128_destroy(&state);
+
+    if (result != EBUR128_SUCCESS || std::isinf(loudness)) return;
+
+    float gain = static_cast<float>(pow(10.0, (LOUDNESS_TARGET - loudness) / 20.0));
+
+    if (peak * gain > LOUDNESS_PEAK_CEILING) {
+        gain = LOUDNESS_PEAK_CEILING / peak;
+    }
+
+    for (float& s : audioData) {
+        s *= gain;
+    }
+}
+
 // Apply fade-in/out to audio data to prevent click noise from waveform discontinuity
 void ApplyFade(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels) {
     UINT32 fadeFrames = static_cast<UINT32>(sampleRate * FADE_DURATION);
@@ -721,6 +764,9 @@ int wmain(int argc, wchar_t* argv[]) {
         } else {
             // MF is no longer needed
             MFShutdown();
+
+            // Normalize perceived loudness (EBU R128) to unify volume across sources
+            NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
             // Apply fade to prevent click noise
             ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
