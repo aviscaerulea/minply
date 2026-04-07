@@ -4,18 +4,23 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# vcpkg パス設定（Scoop シム経由インストールに対応）
-$vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
-$shimFile = [System.IO.Path]::ChangeExtension($vcpkgCmd, ".shim")
-if (Test-Path $shimFile) {
-    $vcpkgReal = (Get-Content $shimFile |
-        Where-Object { $_ -match "^path" } |
-        ForEach-Object { ($_ -split '"')[1] } |
-        Select-Object -First 1)
-    $vcpkgRoot = Split-Path $vcpkgReal
+# vcpkg パス設定（VCPKG_INSTALLATION_ROOT 環境変数 → Scoop シム の優先順）
+if ($env:VCPKG_INSTALLATION_ROOT) {
+    $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
 }
 else {
-    $vcpkgRoot = Split-Path $vcpkgCmd
+    $vcpkgCmd = (Get-Command vcpkg -ErrorAction Stop).Source
+    $shimFile = [System.IO.Path]::ChangeExtension($vcpkgCmd, ".shim")
+    if (Test-Path $shimFile) {
+        $vcpkgReal = (Get-Content $shimFile |
+            Where-Object { $_ -match "^path" } |
+            ForEach-Object { ($_ -split '"')[1] } |
+            Select-Object -First 1)
+        $vcpkgRoot = Split-Path $vcpkgReal
+    }
+    else {
+        $vcpkgRoot = Split-Path $vcpkgCmd
+    }
 }
 $vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
 $vcpkgLib = "$vcpkgRoot\installed\x64-windows-static\lib"
