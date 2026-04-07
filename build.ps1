@@ -25,6 +25,20 @@ else {
 $vcpkgInclude = "$vcpkgRoot\installed\x64-windows-static\include"
 $vcpkgLib = "$vcpkgRoot\installed\x64-windows-static\lib"
 
+Write-Host "vcpkgRoot:    $vcpkgRoot"
+Write-Host "vcpkgInclude: $vcpkgInclude"
+Write-Host "vcpkgLib:     $vcpkgLib"
+Write-Host "ebur128.h exists: $(Test-Path "$vcpkgInclude\ebur128.h")"
+if (-not (Test-Path "$vcpkgInclude\ebur128.h")) {
+    Write-Host "Contents of installed dir:"
+    if (Test-Path "$vcpkgRoot\installed") {
+        Get-ChildItem "$vcpkgRoot\installed" | ForEach-Object { Write-Host "  $_" }
+    }
+    else {
+        Write-Host "  (not found)"
+    }
+}
+
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 if (-not (Test-Path $vswhere)) { Write-Error "vswhere.exe が見つからない: $vswhere"; exit 1 }
 $vsPath = & $vswhere -products '*' -latest -property installationPath
