@@ -68,10 +68,6 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 [guard]
 # ガードトーンの有効/無効（デフォルト: true）
 enabled = true
-# 周波数 Hz（デフォルト: 19000.0）
-frequency = 19000.0
-# 振幅、約 -60dB（デフォルト: 0.001）
-amplitude = 0.001
 # リードイン秒数（デフォルト: 1.2）
 lead_in_duration = 1.2
 # リードアウト秒数（デフォルト: 1.2）
