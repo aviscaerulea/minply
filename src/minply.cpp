@@ -56,7 +56,7 @@ constexpr float BLE_GUARD_FREQ = 19000.0f;  // Guard tone frequency in Hz (inaud
 constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
 constexpr float TWO_PI = 6.2831853f;        // 2π
 
-constexpr float LOUDNESS_TARGET = -6.0f;         // Target integrated loudness in LUFS (optimized for notification sounds)
+constexpr float LOUDNESS_TARGET = -16.0f;        // Target integrated loudness in LUFS (optimized for notification sounds)
 constexpr float LOUDNESS_PEAK_CEILING = 0.891f;  // True peak ceiling (-1dBFS); prevents clipping after loudness gain
 constexpr float LOUDNESS_MIN_PEAK = 1e-6f;       // Minimum peak threshold; skip normalization for near-silence
 
