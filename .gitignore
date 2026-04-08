@@ -16,3 +16,6 @@ test.bat
 
 # Visual Studio
 .vs/
+
+# Local config
+*.local.*

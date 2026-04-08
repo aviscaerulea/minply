@@ -34,6 +34,8 @@
 #include <opus/opus.h>
 #include <ebur128.h>
 #include <cmath>
+#include <string>
+#include <cstdlib>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -63,6 +65,21 @@ constexpr float LOUDNESS_MIN_PEAK = 1e-6f;       // Minimum peak threshold; skip
 constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 constexpr DWORD DRAIN_WAIT_MS = 300;       // Wait time for device buffer drain in milliseconds
+
+// Application configuration
+//
+// Loaded from minply.toml / minply.local.toml in the executable directory.
+// Missing file or missing key falls back to the default value.
+struct AppConfig {
+    bool  guardEnabled        = true;
+    float guardFrequency      = BLE_GUARD_FREQ;
+    float guardAmplitude      = BLE_GUARD_AMP;
+    float leadInDuration      = LEAD_IN_DURATION;
+    float leadOutDuration     = LEAD_OUT_DURATION;
+    bool  loudnessEnabled     = true;
+    float loudnessTarget      = LOUDNESS_TARGET;
+    float loudnessPeakCeiling = LOUDNESS_PEAK_CEILING;
+};
 
 // Print error message to stderr
 void PrintError(const char* message) {
@@ -477,16 +494,17 @@ bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
     return success;
 }
 
-// Generate inaudible 19kHz sine wave buffer for BLE anti-clipping
+// Generate inaudible sine wave buffer for BLE anti-clipping
 // BLE devices enter power-saving mode on digital silence, causing audio clipping.
 // A 19kHz tone at ~-60dB is inaudible to adults but keeps the BLE codec active.
-std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float duration) {
+std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float duration,
+                                     float freq, float amp) {
     size_t totalFrames = static_cast<size_t>(sampleRate * duration);
     std::vector<float> buffer(totalFrames * channels);
 
     for (size_t i = 0; i < totalFrames; i++) {
         float t = static_cast<float>(i) / sampleRate;
-        float sample = BLE_GUARD_AMP * sinf(TWO_PI * BLE_GUARD_FREQ * t);
+        float sample = amp * sinf(TWO_PI * freq * t);
         for (UINT32 ch = 0; ch < channels; ch++) {
             buffer[i * channels + ch] = sample;
         }
@@ -495,11 +513,12 @@ std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float du
     return buffer;
 }
 
-// Normalize audio to LOUDNESS_TARGET using EBU R128 integrated loudness (ITU-R BS.1770-4)
+// Normalize audio using EBU R128 integrated loudness (ITU-R BS.1770-4)
 //
-// Measures integrated loudness via libebur128, computes gain to reach LOUDNESS_TARGET,
-// then clamps gain if true peak would exceed LOUDNESS_PEAK_CEILING.
-void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels) {
+// Measures integrated loudness via libebur128, computes gain to reach target,
+// then clamps gain if true peak would exceed peakCeiling.
+void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels,
+                       float target, float peakCeiling) {
     if (audioData.empty()) return;
 
     float peak = 0.0f;
@@ -521,10 +540,10 @@ void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 
 
     if (result != EBUR128_SUCCESS || std::isinf(loudness)) return;
 
-    float gain = static_cast<float>(pow(10.0, (LOUDNESS_TARGET - loudness) / 20.0));
+    float gain = static_cast<float>(pow(10.0, (target - loudness) / 20.0));
 
-    if (peak * gain > LOUDNESS_PEAK_CEILING) {
-        gain = LOUDNESS_PEAK_CEILING / peak;
+    if (peak * gain > peakCeiling) {
+        gain = peakCeiling / peak;
     }
 
     for (float& s : audioData) {
@@ -703,6 +722,109 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
     return success;
 }
 
+// Parse a subset of TOML (sections + bool/float key-value) into config.
+//
+// Unknown sections and keys are silently ignored.
+// Returns false only if the file cannot be opened; parse warnings go to stderr.
+static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
+    HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == INVALID_FILE_SIZE) {
+        CloseHandle(hFile);
+        return false;
+    }
+    std::string content(fileSize, '\0');
+    DWORD bytesRead = 0;
+    bool ok = (fileSize == 0) || ReadFile(hFile, &content[0], fileSize, &bytesRead, nullptr);
+    CloseHandle(hFile);
+    if (!ok) return false;
+    content.resize(bytesRead);
+
+    std::string section;
+    size_t lineStart = 0;
+    int lineNum = 0;
+
+    auto trim = [](const std::string& s) -> std::string {
+        const char* ws = " \t\r";
+        size_t a = s.find_first_not_of(ws);
+        if (a == std::string::npos) return {};
+        size_t b = s.find_last_not_of(ws);
+        return s.substr(a, b - a + 1);
+    };
+
+    while (lineStart < content.size()) {
+        size_t lineEnd = content.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = content.size();
+        std::string line = trim(content.substr(lineStart, lineEnd - lineStart));
+        lineStart = lineEnd + 1;
+        lineNum++;
+
+        if (line.empty() || line[0] == '#') continue;
+
+        if (line[0] == '[' && line.back() == ']') {
+            section = trim(line.substr(1, line.size() - 2));
+            continue;
+        }
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = trim(line.substr(0, eq));
+        std::string val = trim(line.substr(eq + 1));
+
+        size_t hash = val.find('#');
+        if (hash != std::string::npos) val = trim(val.substr(0, hash));
+
+        auto parseBool = [&](bool& dest) {
+            if (val == "true") dest = true;
+            else if (val == "false") dest = false;
+            else std::cerr << "Warning: config line " << lineNum << ": invalid bool '" << val << "'" << std::endl;
+        };
+        auto parseFloat = [&](float& dest) {
+            char* end;
+            float v = strtof(val.c_str(), &end);
+            if (end != val.c_str()) dest = v;
+            else std::cerr << "Warning: config line " << lineNum << ": invalid float '" << val << "'" << std::endl;
+        };
+
+        if (section == "guard") {
+            if      (key == "enabled")          parseBool(config.guardEnabled);
+            else if (key == "frequency")        parseFloat(config.guardFrequency);
+            else if (key == "amplitude")        parseFloat(config.guardAmplitude);
+            else if (key == "lead_in_duration") parseFloat(config.leadInDuration);
+            else if (key == "lead_out_duration") parseFloat(config.leadOutDuration);
+        } else if (section == "loudness") {
+            if      (key == "enabled")      parseBool(config.loudnessEnabled);
+            else if (key == "target")       parseFloat(config.loudnessTarget);
+            else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling);
+        }
+    }
+    return true;
+}
+
+// Load configuration from minply.toml and minply.local.toml in the executable directory.
+//
+// Missing files are silently skipped. Returns default AppConfig if both are absent.
+static AppConfig LoadConfig() {
+    AppConfig config;
+
+    wchar_t exePath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+
+    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
+    if (!lastSlash) return config;
+    *(lastSlash + 1) = L'\0';
+
+    std::wstring dir(exePath);
+    ParseTomlFile((dir + L"minply.toml").c_str(), config);
+    ParseTomlFile((dir + L"minply.local.toml").c_str(), config);
+
+    return config;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     // Check arguments
     if (argc != 2) {
@@ -712,6 +834,9 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     const wchar_t* filePath = argv[1];
+
+    // Load configuration
+    AppConfig config = LoadConfig();
 
     // Check if file exists
     DWORD fileAttr = GetFileAttributesW(filePath);
@@ -766,16 +891,22 @@ int wmain(int argc, wchar_t* argv[]) {
             MFShutdown();
 
             // Normalize perceived loudness (EBU R128) to unify volume across sources
-            NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+            if (config.loudnessEnabled) {
+                NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
+                                  config.loudnessTarget, config.loudnessPeakCeiling);
+            }
 
             // Apply fade to prevent click noise
             ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
             // Generate BLE guard tone buffers
-            std::vector<float> leadIn = GenerateBleGuard(
-                mixFormat->nSamplesPerSec, mixFormat->nChannels, LEAD_IN_DURATION);
-            std::vector<float> leadOut = GenerateBleGuard(
-                mixFormat->nSamplesPerSec, mixFormat->nChannels, LEAD_OUT_DURATION);
+            std::vector<float> leadIn, leadOut;
+            if (config.guardEnabled) {
+                leadIn = GenerateBleGuard(mixFormat->nSamplesPerSec, mixFormat->nChannels,
+                                          config.leadInDuration, config.guardFrequency, config.guardAmplitude);
+                leadOut = GenerateBleGuard(mixFormat->nSamplesPerSec, mixFormat->nChannels,
+                                           config.leadOutDuration, config.guardFrequency, config.guardAmplitude);
+            }
 
             // Play with BLE guard tones to prevent BLE device from entering power-saving mode
             if (!PlayAudio(decodedData, mixFormat, leadIn, leadOut)) {

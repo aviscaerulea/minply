@@ -58,6 +58,34 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 | 4 | オーディオデバイスの初期化失敗 |
 | 5 | 再生失敗 |
 
+## 設定ファイル
+
+実行ファイルと同じディレクトリに `minply.toml` を置くことで動作を調整できる。設定ファイルがない場合はデフォルト値で動作する。
+
+`minply.local.toml` を用意すると `minply.toml` の後に読み込まれ、設定を上書きできる（個人環境専用の設定に使用する）。
+
+```toml
+[guard]
+# ガードトーンの有効/無効（デフォルト: true）
+enabled = true
+# 周波数 Hz（デフォルト: 19000.0）
+frequency = 19000.0
+# 振幅、約 -60dB（デフォルト: 0.001）
+amplitude = 0.001
+# リードイン秒数（デフォルト: 1.2）
+lead_in_duration = 1.2
+# リードアウト秒数（デフォルト: 1.2）
+lead_out_duration = 1.2
+
+[loudness]
+# ラウドネスノーマライズの有効/無効（デフォルト: true）
+enabled = true
+# 目標ラウドネス LUFS（デフォルト: -16.0）
+target = -16.0
+# トゥルーピーク上限（デフォルト: 0.891 = -1dBFS）
+peak_ceiling = 0.891
+```
+
 ## 技術仕様
 
 - 言語：C++17（MSVC）
