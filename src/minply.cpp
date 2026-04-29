@@ -4,10 +4,11 @@
  * Lightweight and fast audio player with BLE receiver lag compensation
  *
  * Usage:
- *   minply.exe <audio file path>
+ *   minply.exe [audio file path | -]
  *
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
+ *   - Accepts audio data from stdin (no argument or - as argument)
  *   - Plays inaudible 19kHz guard tone before/after audio (BLE anti-clipping)
  *   - Exits immediately after playback completes
  *
@@ -28,6 +29,9 @@
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
+#include <shlwapi.h>
+#include <io.h>
+#include <fcntl.h>
 #include <iostream>
 #include <vector>
 #include <ogg/ogg.h>
@@ -41,6 +45,7 @@
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
+#pragma comment(lib, "shlwapi.lib")
 // Note: opus.lib and ogg.lib are linked via build.ps1
 
 // Error codes
@@ -123,26 +128,29 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
                                  UINT32 srcRate, UINT32 srcChannels,
                                  UINT32 dstRate, UINT32 dstChannels);
 
-// Read WAV file directly without Media Foundation (bypass resampling for matching formats)
-bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
-                      UINT32 targetSampleRate, UINT32 targetChannels) {
-    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
+// Read WAV data from buffer (bypass MF resampling for matching formats)
+bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioData,
+                     UINT32 targetSampleRate, UINT32 targetChannels) {
+    size_t pos = 0;
 
-    auto closeFile = [&]() { CloseHandle(hFile); };
+    // バッファから n バイトを dst にコピーして pos を進める
+    auto readBytes = [&](void* dst, size_t n) -> bool {
+        if (pos + n > size) return false;
+        memcpy(dst, data + pos, n);
+        pos += n;
+        return true;
+    };
+    // バッファ上で n バイト前進する（読み捨て）
+    auto skipBytes = [&](size_t n) -> bool {
+        if (pos + n > size) return false;
+        pos += n;
+        return true;
+    };
 
-    // Read RIFF/WAVE header
+    // Validate RIFF/WAVE header
     char header[12];
-    DWORD bytesRead;
-    if (!ReadFile(hFile, header, 12, &bytesRead, nullptr) || bytesRead != 12) {
-        closeFile();
-        return false;
-    }
-    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-        closeFile();
-        return false;
-    }
+    if (!readBytes(header, 12)) return false;
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) return false;
 
     // Find fmt chunk
     WAVEFORMATEXTENSIBLE fmt = {};
@@ -150,116 +158,89 @@ bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
     while (true) {
         char chunkId[4];
         DWORD chunkSize;
-        if (!ReadFile(hFile, chunkId, 4, &bytesRead, nullptr) || bytesRead != 4) break;
-        if (!ReadFile(hFile, &chunkSize, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+        if (!readBytes(chunkId, 4) || !readBytes(&chunkSize, 4)) break;
 
         if (memcmp(chunkId, "fmt ", 4) == 0) {
             if (chunkSize < 16) break;
             BYTE fmtBuf[40] = {};
             DWORD fmtReadSize = (std::min)(chunkSize, static_cast<DWORD>(40));
-            if (!ReadFile(hFile, fmtBuf, fmtReadSize, &bytesRead, nullptr)) break;
+            if (!readBytes(fmtBuf, fmtReadSize)) break;
             memcpy(&fmt, fmtBuf, fmtReadSize);
             fmtFound = true;
-            if (chunkSize > fmtReadSize) {
-                SetFilePointer(hFile, chunkSize - fmtReadSize, nullptr, FILE_CURRENT);
-            }
+            if (chunkSize > fmtReadSize && !skipBytes(chunkSize - fmtReadSize)) break;
             break;
         }
-        SetFilePointer(hFile, chunkSize, nullptr, FILE_CURRENT);
+        if (!skipBytes(chunkSize)) break;
     }
-
-    if (!fmtFound) {
-        closeFile();
-        return false;
-    }
+    if (!fmtFound) return false;
 
     // Normalize format tag
     WORD actualFormatTag = fmt.Format.wFormatTag;
     if (actualFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt.Format.cbSize >= 22) {
-        actualFormatTag = *reinterpret_cast<WORD*>(&fmt.SubFormat);
+        actualFormatTag = *reinterpret_cast<const WORD*>(&fmt.SubFormat);
     }
 
-    // Check format compatibility
-    if (actualFormatTag != WAVE_FORMAT_PCM && actualFormatTag != WAVE_FORMAT_IEEE_FLOAT) {
-        closeFile();
-        return false;
-    }
-    if (fmt.Format.nSamplesPerSec != targetSampleRate) {
-        closeFile();
-        return false;
-    }
+    if (actualFormatTag != WAVE_FORMAT_PCM && actualFormatTag != WAVE_FORMAT_IEEE_FLOAT) return false;
+    if (fmt.Format.nSamplesPerSec != targetSampleRate) return false;
 
-    // Find data chunk
+    // Find data chunk (rescan from offset 12)
+    pos = 12;
     DWORD dataSize = 0;
     bool dataFound = false;
-    SetFilePointer(hFile, 12, nullptr, FILE_BEGIN);
     while (true) {
         char chunkId[4];
         DWORD chunkSize;
-        if (!ReadFile(hFile, chunkId, 4, &bytesRead, nullptr) || bytesRead != 4) break;
-        if (!ReadFile(hFile, &chunkSize, 4, &bytesRead, nullptr) || bytesRead != 4) break;
+        if (!readBytes(chunkId, 4) || !readBytes(&chunkSize, 4)) break;
 
         if (memcmp(chunkId, "data", 4) == 0) {
             dataSize = chunkSize;
             dataFound = true;
             break;
         }
-        SetFilePointer(hFile, chunkSize, nullptr, FILE_CURRENT);
+        if (!skipBytes(chunkSize)) break;
     }
+    if (!dataFound || dataSize == 0) return false;
+    if (pos + dataSize > size) return false;
 
-    if (!dataFound || dataSize == 0) {
-        closeFile();
-        return false;
-    }
-
-    // Read and convert PCM data to float32
+    // Convert PCM samples to float32
     UINT32 bytesPerSample = fmt.Format.wBitsPerSample / 8;
     UINT32 totalSamples = dataSize / bytesPerSample;
     audioData.resize(totalSamples);
 
-    if (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32) {
-        // float32 WAV - direct read
-        if (!ReadFile(hFile, audioData.data(), dataSize, &bytesRead, nullptr) || bytesRead != dataSize) {
-            closeFile();
-            return false;
-        }
-    } else if (actualFormatTag == WAVE_FORMAT_PCM) {
-        // int PCM - convert to float32
-        std::vector<BYTE> rawData(dataSize);
-        if (!ReadFile(hFile, rawData.data(), dataSize, &bytesRead, nullptr) || bytesRead != dataSize) {
-            closeFile();
-            return false;
-        }
+    const BYTE* rawData = data + pos;
 
+    if (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32) {
+        // float32 WAV - direct copy
+        memcpy(audioData.data(), rawData, dataSize);
+    }
+    else if (actualFormatTag == WAVE_FORMAT_PCM) {
+        // int PCM - convert to float32
         if (fmt.Format.wBitsPerSample == 16) {
-            // int16 -> float32
-            const int16_t* samples = reinterpret_cast<const int16_t*>(rawData.data());
+            const int16_t* samples = reinterpret_cast<const int16_t*>(rawData);
             for (UINT32 i = 0; i < totalSamples; i++) {
                 audioData[i] = static_cast<float>(samples[i]) / 32768.0f;
             }
-        } else if (fmt.Format.wBitsPerSample == 24) {
-            // int24 -> float32
+        }
+        else if (fmt.Format.wBitsPerSample == 24) {
             for (UINT32 i = 0; i < totalSamples; i++) {
                 int32_t sample = (rawData[i * 3] << 8) | (rawData[i * 3 + 1] << 16) | (rawData[i * 3 + 2] << 24);
                 sample >>= 8; // sign extend
                 audioData[i] = static_cast<float>(sample) / 8388608.0f;
             }
-        } else if (fmt.Format.wBitsPerSample == 32) {
-            // int32 -> float32
-            const int32_t* samples = reinterpret_cast<const int32_t*>(rawData.data());
+        }
+        else if (fmt.Format.wBitsPerSample == 32) {
+            const int32_t* samples = reinterpret_cast<const int32_t*>(rawData);
             for (UINT32 i = 0; i < totalSamples; i++) {
                 audioData[i] = static_cast<float>(samples[i]) / 2147483648.0f;
             }
-        } else {
-            closeFile();
+        }
+        else {
             return false;
         }
-    } else {
-        closeFile();
+    }
+    else {
         return false;
     }
-
-    closeFile();
 
     // Channel conversion (e.g. mono -> stereo)
     if (fmt.Format.nChannels != targetChannels) {
@@ -268,13 +249,6 @@ bool TryReadWavDirect(const wchar_t* filePath, std::vector<float>& audioData,
     }
 
     return true;
-}
-
-// Check if file is Opus format
-bool IsOpusFile(const wchar_t* filePath) {
-    const wchar_t* ext = wcsrchr(filePath, L'.');
-    if (!ext) return false;
-    return (_wcsicmp(ext, L".opus") == 0 || _wcsicmp(ext, L".ogg") == 0);
 }
 
 // Convert audio format (resampling and channel conversion)
@@ -309,15 +283,9 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
     return output;
 }
 
-// Decode Opus file (.opus and .ogg Opus)
-bool TryDecodeOpusFile(const wchar_t* filePath, std::vector<float>& audioData,
-                       UINT32 targetSampleRate, UINT32 targetChannels) {
-    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
-                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) return false;
-
-    auto closeFile = [&]() { CloseHandle(hFile); };
-
+// Decode Opus/Ogg data from buffer (.opus and .ogg Opus)
+bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audioData,
+                         UINT32 targetSampleRate, UINT32 targetChannels) {
     ogg_sync_state   oy;
     ogg_stream_state os;
     ogg_page         og;
@@ -331,70 +299,68 @@ bool TryDecodeOpusFile(const wchar_t* filePath, std::vector<float>& audioData,
     std::vector<float> decodedFloat;
     int packetCount = 0;
 
-    const size_t CHUNK_SIZE = 4096;
-    bool success = false;
+    // Feed entire buffer in 64KB chunks (ogg_sync_buffer takes long)
+    const size_t CHUNK_SIZE = 65536;
+    size_t offset = 0;
+    while (offset < size) {
+        size_t toWrite = (std::min)(CHUNK_SIZE, size - offset);
+        char* buf = ogg_sync_buffer(&oy, static_cast<long>(toWrite));
+        if (!buf) break;
+        memcpy(buf, data + offset, toWrite);
+        ogg_sync_wrote(&oy, static_cast<long>(toWrite));
+        offset += toWrite;
+    }
 
     // Opus stream structure: packet 1 = OpusHead, packet 2 = OpusTags, packet 3+ = audio data
-    while (true) {
-        char* buffer = ogg_sync_buffer(&oy, CHUNK_SIZE);
-        if (!buffer) break;
-        DWORD bytesRead;
-        if (!ReadFile(hFile, buffer, CHUNK_SIZE, &bytesRead, nullptr) || bytesRead == 0) {
-            break;
+    while (ogg_sync_pageout(&oy, &og) == 1) {
+        if (!streamInitialized) {
+            ogg_stream_init(&os, ogg_page_serialno(&og));
+            streamInitialized = true;
         }
-        ogg_sync_wrote(&oy, bytesRead);
+        ogg_stream_pagein(&os, &og);
 
-        while (ogg_sync_pageout(&oy, &og) == 1) {
-            if (!streamInitialized) {
-                ogg_stream_init(&os, ogg_page_serialno(&og));
-                streamInitialized = true;
-            }
-            ogg_stream_pagein(&os, &og);
+        while (ogg_stream_packetout(&os, &op) == 1) {
+            packetCount++;
 
-            while (ogg_stream_packetout(&os, &op) == 1) {
-                packetCount++;
-
-                if (packetCount == 1) {
-                    // OpusHead packet (format and channel information)
-                    if (op.bytes >= 19 && memcmp(op.packet, "OpusHead", 8) == 0) {
-                        opusChannels = op.packet[9];
-                        int error;
-                        decoder = opus_decoder_create(opusSampleRate, opusChannels, &error);
-                        if (error != OPUS_OK || !decoder) {
-                            closeFile();
-                            if (streamInitialized) ogg_stream_clear(&os);
-                            ogg_sync_clear(&oy);
-                            return false;
-                        }
-                    } else {
-                        // Not an Opus file
-                        closeFile();
-                        if (decoder) opus_decoder_destroy(decoder);
+            if (packetCount == 1) {
+                // OpusHead packet (format and channel information)
+                if (op.bytes >= 19 && memcmp(op.packet, "OpusHead", 8) == 0) {
+                    opusChannels = op.packet[9];
+                    int error;
+                    decoder = opus_decoder_create(opusSampleRate, opusChannels, &error);
+                    if (error != OPUS_OK || !decoder) {
                         if (streamInitialized) ogg_stream_clear(&os);
                         ogg_sync_clear(&oy);
                         return false;
                     }
-                } else if (packetCount == 2) {
-                    // OpusTags packet (metadata, skip)
-                    continue;
-                } else {
-                    // Audio packet
-                    if (decoder) {
-                        const int MAX_FRAME_SIZE = 5760;  // 120ms at 48kHz
-                        float pcmBuffer[MAX_FRAME_SIZE * 8];  // Support up to 8 channels
-                        int frameSize = opus_decode_float(decoder, op.packet, op.bytes,
-                                                          pcmBuffer, MAX_FRAME_SIZE, 0);
-                        if (frameSize > 0) {
-                            size_t sampleCount = static_cast<size_t>(frameSize) * opusChannels;
-                            decodedFloat.insert(decodedFloat.end(), pcmBuffer, pcmBuffer + sampleCount);
-                        }
+                }
+                else {
+                    // Not an Opus stream
+                    if (decoder) opus_decoder_destroy(decoder);
+                    if (streamInitialized) ogg_stream_clear(&os);
+                    ogg_sync_clear(&oy);
+                    return false;
+                }
+            }
+            else if (packetCount == 2) {
+                // OpusTags packet (metadata, skip)
+                continue;
+            }
+            else {
+                // Audio packet
+                if (decoder) {
+                    const int MAX_FRAME_SIZE = 5760;  // 120ms at 48kHz
+                    float pcmBuffer[MAX_FRAME_SIZE * 8];  // Support up to 8 channels
+                    int frameSize = opus_decode_float(decoder, op.packet, op.bytes,
+                                                      pcmBuffer, MAX_FRAME_SIZE, 0);
+                    if (frameSize > 0) {
+                        size_t sampleCount = static_cast<size_t>(frameSize) * opusChannels;
+                        decodedFloat.insert(decodedFloat.end(), pcmBuffer, pcmBuffer + sampleCount);
                     }
                 }
             }
         }
     }
-
-    closeFile();
 
     if (decoder) opus_decoder_destroy(decoder);
     if (streamInitialized) ogg_stream_clear(&os);
@@ -409,19 +375,36 @@ bool TryDecodeOpusFile(const wchar_t* filePath, std::vector<float>& audioData,
     return true;
 }
 
-// Decode audio file using Media Foundation
-bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
-                     UINT32 targetSampleRate, UINT32 targetChannels) {
+// Decode audio data using Media Foundation
+//
+// Wraps the buffer as a seekable IStream (SHCreateMemStream) and feeds it to
+// MFSourceReader. Seekability is required by most MF decoders (MP3, AAC, FLAC, etc.).
+bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decodedData,
+                       UINT32 targetSampleRate, UINT32 targetChannels) {
     HRESULT hr;
+    IStream* istream = nullptr;
+    IMFByteStream* byteStream = nullptr;
     IMFSourceReader* reader = nullptr;
     IMFMediaType* mediaType = nullptr;
     bool success = false;
 
     do {
-        // Create source reader
-        hr = MFCreateSourceReaderFromURL(filePath, nullptr, &reader);
+        // Wrap memory buffer as a seekable COM IStream
+        istream = SHCreateMemStream(data, static_cast<UINT>(size));
+        if (!istream) {
+            PrintError("Failed to create memory stream");
+            break;
+        }
+
+        hr = MFCreateMFByteStreamOnStream(istream, &byteStream);
         if (FAILED(hr)) {
-            PrintError("Failed to open audio file");
+            PrintError("Failed to create MF byte stream");
+            break;
+        }
+
+        hr = MFCreateSourceReaderFromByteStream(byteStream, nullptr, &reader);
+        if (FAILED(hr)) {
+            PrintError("Failed to open audio data");
             break;
         }
 
@@ -467,15 +450,15 @@ bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
                 IMFMediaBuffer* buffer = nullptr;
                 hr = sample->ConvertToContiguousBuffer(&buffer);
                 if (SUCCEEDED(hr)) {
-                    BYTE* data = nullptr;
+                    BYTE* bufData = nullptr;
                     DWORD dataLen = 0;
 
-                    hr = buffer->Lock(&data, nullptr, &dataLen);
+                    hr = buffer->Lock(&bufData, nullptr, &dataLen);
                     if (SUCCEEDED(hr)) {
                         size_t sampleCount = dataLen / sizeof(float);
                         size_t oldSize = decodedData.size();
                         decodedData.resize(oldSize + sampleCount);
-                        memcpy(&decodedData[oldSize], data, dataLen);
+                        memcpy(&decodedData[oldSize], bufData, dataLen);
                         buffer->Unlock();
                     }
                     buffer->Release();
@@ -490,8 +473,45 @@ bool DecodeAudioFile(const wchar_t* filePath, std::vector<float>& decodedData,
 
     if (mediaType) mediaType->Release();
     if (reader) reader->Release();
+    if (byteStream) byteStream->Release();
+    if (istream) istream->Release();
 
     return success;
+}
+
+// Read all binary data from stdin into buffer
+//
+// Only reads when stdin is a pipe or redirected file to avoid blocking on
+// interactive console input. Switches to binary mode to prevent CRLF translation.
+// Returns false if stdin is not redirected, on read error, or no data was read.
+bool ReadAllStdin(std::vector<BYTE>& buffer) {
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    if (!hStdin || hStdin == INVALID_HANDLE_VALUE) return false;
+
+    DWORD type = GetFileType(hStdin);
+    if (type != FILE_TYPE_PIPE && type != FILE_TYPE_DISK) return false;
+
+    _setmode(_fileno(stdin), _O_BINARY);
+
+    // Pre-reserve 1MB to reduce reallocation overhead for typical notification sounds
+    buffer.reserve(1024 * 1024);
+
+    BYTE chunk[65536];
+    while (true) {
+        DWORD bytesRead = 0;
+        // Distinguish EOF (success with 0 bytes) from read errors:
+        // pipe disconnect / handle invalidation must not be treated as clean EOF
+        // because that would silently truncate the input.
+        if (!ReadFile(hStdin, chunk, sizeof(chunk), &bytesRead, nullptr)) {
+            DWORD err = GetLastError();
+            // ERROR_BROKEN_PIPE on a closed write-end is a normal end-of-stream
+            if (err == ERROR_BROKEN_PIPE) break;
+            return false;
+        }
+        if (bytesRead == 0) break;
+        buffer.insert(buffer.end(), chunk, chunk + bytesRead);
+    }
+    return !buffer.empty();
 }
 
 // Generate inaudible sine wave buffer for BLE anti-clipping
@@ -826,23 +846,68 @@ static AppConfig LoadConfig() {
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    // Check arguments
-    if (argc != 2) {
+    // Validate argument count
+    if (argc > 2) {
         PrintError("Invalid arguments");
-        std::cerr << "Usage: minply.exe <audio file path>" << std::endl;
+        std::cerr << "Usage: minply.exe [audio file path | -]" << std::endl;
         return ERR_INVALID_ARGS;
     }
-
-    const wchar_t* filePath = argv[1];
 
     // Load configuration
     AppConfig config = LoadConfig();
 
-    // Check if file exists
-    DWORD fileAttr = GetFileAttributesW(filePath);
-    if (fileAttr == INVALID_FILE_ATTRIBUTES) {
-        PrintError("File not found");
-        return ERR_FILE_NOT_FOUND;
+    // Load audio data into buffer
+    //
+    // Argument resolution:
+    //   - argc == 1            : read from stdin if piped, else exit silently
+    //   - argv[1] == "-"       : read from stdin (error if empty)
+    //   - argv[1] == file path : read from file
+    std::vector<BYTE> inputData;
+    if (argc == 1) {
+        if (!ReadAllStdin(inputData)) {
+            return EXIT_SUCCESS;
+        }
+    }
+    else if (wcscmp(argv[1], L"-") == 0) {
+        if (!ReadAllStdin(inputData)) {
+            PrintError("No input data on stdin");
+            return ERR_FILE_NOT_FOUND;
+        }
+    }
+    else {
+        const wchar_t* filePath = argv[1];
+        if (GetFileAttributesW(filePath) == INVALID_FILE_ATTRIBUTES) {
+            PrintError("File not found");
+            return ERR_FILE_NOT_FOUND;
+        }
+        HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            PrintError("File not found");
+            return ERR_FILE_NOT_FOUND;
+        }
+        LARGE_INTEGER fileSize;
+        if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart == 0) {
+            CloseHandle(hFile);
+            PrintError("File not found");
+            return ERR_FILE_NOT_FOUND;
+        }
+        // Guard against 4GB+ files: ReadFile takes DWORD, and notification sounds
+        // never approach this size in practice
+        if (fileSize.QuadPart > MAXDWORD) {
+            CloseHandle(hFile);
+            PrintError("File too large");
+            return ERR_DECODE_FAILED;
+        }
+        inputData.resize(static_cast<size_t>(fileSize.QuadPart));
+        DWORD toRead = static_cast<DWORD>(fileSize.QuadPart);
+        DWORD bytesRead = 0;
+        bool readOk = ReadFile(hFile, inputData.data(), toRead, &bytesRead, nullptr);
+        CloseHandle(hFile);
+        if (!readOk || bytesRead != toRead) {
+            PrintError("Failed to read file");
+            return ERR_FILE_NOT_FOUND;
+        }
     }
 
     // Initialize COM
@@ -867,29 +932,35 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!GetDeviceMixFormat(&mixFormat)) {
         PrintError("Failed to get device format");
         exitCode = ERR_WASAPI_INIT;
-    } else {
-        // Decode audio file
+        MFShutdown();
+    }
+    else {
+        const BYTE* buf = inputData.data();
+        size_t sz = inputData.size();
+
+        // Decode audio buffer
         std::vector<float> decodedData;
-        // Try WAV direct read (bypass MF resampling for matching formats)
-        bool decoded = TryReadWavDirect(filePath, decodedData,
-                                        mixFormat->nSamplesPerSec, mixFormat->nChannels);
-        if (!decoded && IsOpusFile(filePath)) {
-            // Try Opus decode
-            decoded = TryDecodeOpusFile(filePath, decodedData,
-                                        mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        bool decoded = false;
+
+        // Dispatch by magic bytes to avoid unnecessary decoder attempts
+        if (sz >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0) {
+            decoded = TryReadWavBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        }
+        if (!decoded && sz >= 4 && memcmp(buf, "OggS", 4) == 0) {
+            decoded = TryDecodeOpusBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
         }
         if (!decoded) {
-            // Fallback to Media Foundation decoder
-            decoded = DecodeAudioFile(filePath, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+            decoded = DecodeAudioBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
         }
 
+        // MF is no longer needed after decode
+        MFShutdown();
+
         if (!decoded) {
-            PrintError("Failed to decode audio file");
+            PrintError("Failed to decode audio");
             exitCode = ERR_DECODE_FAILED;
-        } else {
-            // MF is no longer needed
-            MFShutdown();
-
+        }
+        else {
             // Normalize perceived loudness (EBU R128) to unify volume across sources
             if (config.loudnessEnabled) {
                 NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
@@ -918,10 +989,6 @@ int wmain(int argc, wchar_t* argv[]) {
         CoTaskMemFree(mixFormat);
     }
 
-    // Cleanup
-    if (exitCode == ERR_WASAPI_INIT) {
-        MFShutdown();
-    }
     CoUninitialize();
 
     return exitCode;
