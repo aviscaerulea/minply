@@ -70,6 +70,23 @@ constexpr float LOUDNESS_MIN_PEAK = 1e-6f;       // Minimum peak threshold; skip
 constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
 constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 constexpr DWORD DRAIN_WAIT_MS = 300;       // Wait time for device buffer drain in milliseconds
+constexpr DWORD DRAIN_POLL_MS = 10;        // Polling interval while draining the WASAPI buffer
+constexpr DWORD DRAIN_TIMEOUT_MS = 5000;   // Hard cap on drain polling to prevent infinite loops on stuck devices
+
+// PCM integer-to-float scale factors (2^(bits-1))
+constexpr float PCM16_SCALE = 32768.0f;        // 2^15
+constexpr float PCM24_SCALE = 8388608.0f;      // 2^23
+constexpr float PCM32_SCALE = 2147483648.0f;   // 2^31
+
+// Opus decoder parameters
+constexpr int  OPUS_OUTPUT_RATE     = 48000;   // Opus always decodes at 48kHz internally
+constexpr int  OPUS_MAX_FRAME_SIZE  = 5760;    // 120ms at 48kHz; the largest frame opus_decode_float emits
+constexpr int  OPUS_MAX_CHANNELS    = 8;       // Upper bound used for output buffer sizing
+
+// I/O chunk sizes
+constexpr size_t STDIN_INITIAL_RESERVE = 1024 * 1024;  // Pre-reserve to avoid reallocation for typical notification sounds
+constexpr size_t STDIN_READ_CHUNK      = 65536;
+constexpr size_t OGG_FEED_CHUNK        = 65536;
 
 // Application configuration
 //
@@ -135,24 +152,22 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
 
     // バッファから n バイトを dst にコピーして pos を進める
     auto readBytes = [&](void* dst, size_t n) -> bool {
-        if (pos + n > size) return false;
+        if (n > size - pos) return false;
         memcpy(dst, data + pos, n);
         pos += n;
         return true;
     };
     // バッファ上で n バイト前進する（読み捨て）
     auto skipBytes = [&](size_t n) -> bool {
-        if (pos + n > size) return false;
+        if (n > size - pos) return false;
         pos += n;
         return true;
     };
 
-    // Validate RIFF/WAVE header
     char header[12];
     if (!readBytes(header, 12)) return false;
     if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) return false;
 
-    // Find fmt chunk
     WAVEFORMATEXTENSIBLE fmt = {};
     bool fmtFound = false;
     while (true) {
@@ -174,13 +189,17 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
     }
     if (!fmtFound) return false;
 
-    // Normalize format tag
+    // Normalize WAVE_FORMAT_EXTENSIBLE to its underlying SubFormat tag so PCM/Float can share branches below
     WORD actualFormatTag = fmt.Format.wFormatTag;
     if (actualFormatTag == WAVE_FORMAT_EXTENSIBLE && fmt.Format.cbSize >= 22) {
         actualFormatTag = *reinterpret_cast<const WORD*>(&fmt.SubFormat);
     }
 
     if (actualFormatTag != WAVE_FORMAT_PCM && actualFormatTag != WAVE_FORMAT_IEEE_FLOAT) return false;
+    // Reject malformed headers that would later trigger divide-by-zero or oversized allocations
+    if (fmt.Format.nChannels == 0 || fmt.Format.nChannels > OPUS_MAX_CHANNELS) return false;
+    if (fmt.Format.nSamplesPerSec == 0) return false;
+    if (fmt.Format.wBitsPerSample == 0 || (fmt.Format.wBitsPerSample % 8) != 0) return false;
     if (fmt.Format.nSamplesPerSec != targetSampleRate) return false;
 
     // Find data chunk (rescan from offset 12)
@@ -200,9 +219,8 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
         if (!skipBytes(chunkSize)) break;
     }
     if (!dataFound || dataSize == 0) return false;
-    if (pos + dataSize > size) return false;
+    if (dataSize > size - pos) return false;
 
-    // Convert PCM samples to float32
     UINT32 bytesPerSample = fmt.Format.wBitsPerSample / 8;
     UINT32 totalSamples = dataSize / bytesPerSample;
     audioData.resize(totalSamples);
@@ -210,28 +228,30 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
     const BYTE* rawData = data + pos;
 
     if (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32) {
-        // float32 WAV - direct copy
         memcpy(audioData.data(), rawData, dataSize);
     }
     else if (actualFormatTag == WAVE_FORMAT_PCM) {
-        // int PCM - convert to float32
         if (fmt.Format.wBitsPerSample == 16) {
             const int16_t* samples = reinterpret_cast<const int16_t*>(rawData);
             for (UINT32 i = 0; i < totalSamples; i++) {
-                audioData[i] = static_cast<float>(samples[i]) / 32768.0f;
+                audioData[i] = static_cast<float>(samples[i]) / PCM16_SCALE;
             }
         }
         else if (fmt.Format.wBitsPerSample == 24) {
+            // Build via uint32_t to keep the left-shifts well-defined, then arithmetic-shift back to sign-extend.
+            // (Shifting a signed int into the sign bit is UB even though MSVC tolerates it.)
             for (UINT32 i = 0; i < totalSamples; i++) {
-                int32_t sample = (rawData[i * 3] << 8) | (rawData[i * 3 + 1] << 16) | (rawData[i * 3 + 2] << 24);
-                sample >>= 8; // sign extend
-                audioData[i] = static_cast<float>(sample) / 8388608.0f;
+                uint32_t u =  static_cast<uint32_t>(rawData[i * 3])      << 8
+                           | static_cast<uint32_t>(rawData[i * 3 + 1]) << 16
+                           | static_cast<uint32_t>(rawData[i * 3 + 2]) << 24;
+                int32_t sample = static_cast<int32_t>(u) >> 8;
+                audioData[i] = static_cast<float>(sample) / PCM24_SCALE;
             }
         }
         else if (fmt.Format.wBitsPerSample == 32) {
             const int32_t* samples = reinterpret_cast<const int32_t*>(rawData);
             for (UINT32 i = 0; i < totalSamples; i++) {
-                audioData[i] = static_cast<float>(samples[i]) / 2147483648.0f;
+                audioData[i] = static_cast<float>(samples[i]) / PCM32_SCALE;
             }
         }
         else {
@@ -263,6 +283,7 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
     }
 
     size_t srcFrames = input.size() / srcChannels;
+    if (srcFrames == 0) return {};
     size_t dstFrames = static_cast<size_t>((static_cast<uint64_t>(srcFrames) * dstRate) / srcRate);
     std::vector<float> output(dstFrames * dstChannels);
 
@@ -295,15 +316,15 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
     bool streamInitialized = false;
     OpusDecoder* decoder = nullptr;
     int opusChannels = 0;
-    const int opusSampleRate = 48000;
     std::vector<float> decodedFloat;
+    // Heap-allocated PCM scratch buffer; stack allocation would consume ~180KB and risk overflow on deep call stacks
+    std::vector<float> pcmBuffer(static_cast<size_t>(OPUS_MAX_FRAME_SIZE) * OPUS_MAX_CHANNELS);
     int packetCount = 0;
 
-    // Feed entire buffer in 64KB chunks (ogg_sync_buffer takes long)
-    const size_t CHUNK_SIZE = 65536;
+    // Feed entire buffer in chunks; ogg_sync_buffer reallocs are expensive for large single allocations
     size_t offset = 0;
     while (offset < size) {
-        size_t toWrite = (std::min)(CHUNK_SIZE, size - offset);
+        size_t toWrite = (std::min)(OGG_FEED_CHUNK, size - offset);
         char* buf = ogg_sync_buffer(&oy, static_cast<long>(toWrite));
         if (!buf) break;
         memcpy(buf, data + offset, toWrite);
@@ -323,11 +344,16 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
             packetCount++;
 
             if (packetCount == 1) {
-                // OpusHead packet (format and channel information)
+                // OpusHead packet carries channel count and reserves the codec context for audio packets
                 if (op.bytes >= 19 && memcmp(op.packet, "OpusHead", 8) == 0) {
                     opusChannels = op.packet[9];
+                    if (opusChannels < 1 || opusChannels > OPUS_MAX_CHANNELS) {
+                        if (streamInitialized) ogg_stream_clear(&os);
+                        ogg_sync_clear(&oy);
+                        return false;
+                    }
                     int error;
-                    decoder = opus_decoder_create(opusSampleRate, opusChannels, &error);
+                    decoder = opus_decoder_create(OPUS_OUTPUT_RATE, opusChannels, &error);
                     if (error != OPUS_OK || !decoder) {
                         if (streamInitialized) ogg_stream_clear(&os);
                         ogg_sync_clear(&oy);
@@ -335,7 +361,6 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
                     }
                 }
                 else {
-                    // Not an Opus stream
                     if (decoder) opus_decoder_destroy(decoder);
                     if (streamInitialized) ogg_stream_clear(&os);
                     ogg_sync_clear(&oy);
@@ -343,19 +368,17 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
                 }
             }
             else if (packetCount == 2) {
-                // OpusTags packet (metadata, skip)
+                // OpusTags (metadata) - intentionally skipped
                 continue;
             }
             else {
-                // Audio packet
                 if (decoder) {
-                    const int MAX_FRAME_SIZE = 5760;  // 120ms at 48kHz
-                    float pcmBuffer[MAX_FRAME_SIZE * 8];  // Support up to 8 channels
                     int frameSize = opus_decode_float(decoder, op.packet, op.bytes,
-                                                      pcmBuffer, MAX_FRAME_SIZE, 0);
+                                                      pcmBuffer.data(), OPUS_MAX_FRAME_SIZE, 0);
                     if (frameSize > 0) {
                         size_t sampleCount = static_cast<size_t>(frameSize) * opusChannels;
-                        decodedFloat.insert(decodedFloat.end(), pcmBuffer, pcmBuffer + sampleCount);
+                        decodedFloat.insert(decodedFloat.end(),
+                                            pcmBuffer.data(), pcmBuffer.data() + sampleCount);
                     }
                 }
             }
@@ -368,8 +391,7 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
 
     if (decodedFloat.empty()) return false;
 
-    // Format conversion
-    audioData = ConvertFormat(decodedFloat, opusSampleRate, opusChannels,
+    audioData = ConvertFormat(decodedFloat, OPUS_OUTPUT_RATE, opusChannels,
                               targetSampleRate, targetChannels);
 
     return true;
@@ -389,7 +411,11 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
     bool success = false;
 
     do {
-        // Wrap memory buffer as a seekable COM IStream
+        // SHCreateMemStream takes a UINT length; refuse to silently truncate >4GB inputs
+        if (size > MAXUINT) {
+            PrintError("Input too large for in-memory decode");
+            break;
+        }
         istream = SHCreateMemStream(data, static_cast<UINT>(size));
         if (!istream) {
             PrintError("Failed to create memory stream");
@@ -408,7 +434,7 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
             break;
         }
 
-        // Configure output media type (PCM float)
+        // Output media type: 32-bit float PCM at the device's mix rate/channels
         hr = MFCreateMediaType(&mediaType);
         if (FAILED(hr)) break;
 
@@ -433,7 +459,6 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
             break;
         }
 
-        // Read all samples
         while (true) {
             DWORD flags = 0;
             IMFSample* sample = nullptr;
@@ -442,7 +467,13 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
                                    nullptr, &flags, nullptr, &sample);
             if (FAILED(hr)) break;
 
+            // MF reports stream-level errors via flags rather than HRESULT; honor them to avoid spinning forever
+            if (flags & MF_SOURCE_READERF_ERROR) {
+                if (sample) sample->Release();
+                break;
+            }
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
+                if (sample) sample->Release();
                 break;
             }
 
@@ -493,10 +524,9 @@ bool ReadAllStdin(std::vector<BYTE>& buffer) {
 
     _setmode(_fileno(stdin), _O_BINARY);
 
-    // Pre-reserve 1MB to reduce reallocation overhead for typical notification sounds
-    buffer.reserve(1024 * 1024);
+    buffer.reserve(STDIN_INITIAL_RESERVE);
 
-    BYTE chunk[65536];
+    BYTE chunk[STDIN_READ_CHUNK];
     while (true) {
         DWORD bytesRead = 0;
         // Distinguish EOF (success with 0 bytes) from read errors:
@@ -509,6 +539,11 @@ bool ReadAllStdin(std::vector<BYTE>& buffer) {
             return false;
         }
         if (bytesRead == 0) break;
+        // Cap at 4GB; the in-memory decode path uses SHCreateMemStream (UINT length)
+        if (bytesRead > MAXUINT - buffer.size()) {
+            PrintError("stdin input exceeds 4GB limit");
+            return false;
+        }
         buffer.insert(buffer.end(), chunk, chunk + bytesRead);
     }
     return !buffer.empty();
@@ -558,7 +593,7 @@ void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 
     int result = ebur128_loudness_global(state, &loudness);
     ebur128_destroy(&state);
 
-    if (result != EBUR128_SUCCESS || std::isinf(loudness)) return;
+    if (result != EBUR128_SUCCESS || !std::isfinite(loudness)) return;
 
     float gain = static_cast<float>(pow(10.0, (target - loudness) / 20.0));
 
@@ -610,7 +645,6 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
     UINT32 channels = mixFormat->nChannels;
 
     do {
-        // Create device enumerator
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                               __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator);
         if (FAILED(hr)) {
@@ -618,28 +652,24 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Get default audio device
         hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
         if (FAILED(hr)) {
             PrintError("Failed to get default audio device");
             break;
         }
 
-        // Activate audio client
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
         if (FAILED(hr)) {
             PrintError("Failed to activate audio client");
             break;
         }
 
-        // Create event
         eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         if (!eventHandle) {
             PrintError("Failed to create event");
             break;
         }
 
-        // Initialize audio client with device's mix format
         hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                      AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                                      0, 0, mixFormat, nullptr);
@@ -648,14 +678,12 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Set event handle
         hr = audioClient->SetEventHandle(eventHandle);
         if (FAILED(hr)) {
             PrintError("Failed to set event handle");
             break;
         }
 
-        // Get buffer size
         UINT32 bufferFrameCount;
         hr = audioClient->GetBufferSize(&bufferFrameCount);
         if (FAILED(hr)) {
@@ -663,14 +691,12 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Get render client
         hr = audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient);
         if (FAILED(hr)) {
             PrintError("Failed to get render client");
             break;
         }
 
-        // Start playback
         hr = audioClient->Start();
         if (FAILED(hr)) {
             PrintError("Failed to start audio client");
@@ -679,6 +705,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
 
         // Play lead-in (BLE guard), main audio, then lead-out (BLE guard)
         const std::vector<float>* sources[] = { &leadIn, &audioData, &leadOut };
+        bool playbackAborted = false;
         for (const auto* source : sources) {
             if (source->empty()) continue;
 
@@ -688,11 +715,19 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             while (frameIndex < totalFrames) {
                 DWORD waitResult = WaitForSingleObject(eventHandle, BUFFER_WAIT_MS);
                 if (waitResult == WAIT_TIMEOUT) continue;
-                if (waitResult != WAIT_OBJECT_0) break;
+                // Any non-signaled return (WAIT_FAILED / WAIT_ABANDONED) means the audio thread is no longer
+                // pumping; treat this as a hard failure rather than letting the outer loop report success.
+                if (waitResult != WAIT_OBJECT_0) {
+                    playbackAborted = true;
+                    break;
+                }
 
                 UINT32 numFramesPadding;
                 hr = audioClient->GetCurrentPadding(&numFramesPadding);
-                if (FAILED(hr)) break;
+                if (FAILED(hr)) {
+                    playbackAborted = true;
+                    break;
+                }
 
                 UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
                 if (numFramesAvailable == 0) continue;
@@ -703,30 +738,38 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
 
                 BYTE* buffer;
                 hr = renderClient->GetBuffer(framesToWrite, &buffer);
-                if (FAILED(hr)) break;
+                if (FAILED(hr)) {
+                    playbackAborted = true;
+                    break;
+                }
 
                 size_t byteCount = framesToWrite * mixFormat->nBlockAlign;
                 memcpy(buffer, &(*source)[frameIndex * channels], byteCount);
 
                 hr = renderClient->ReleaseBuffer(framesToWrite, 0);
-                if (FAILED(hr)) break;
+                if (FAILED(hr)) {
+                    playbackAborted = true;
+                    break;
+                }
 
                 frameIndex += framesToWrite;
             }
-            if (FAILED(hr)) break;
+            if (playbackAborted) break;
+        }
+        if (playbackAborted) break;
+
+        // Wait for buffered samples to actually play out, with a hard cap so a stuck device cannot hang the process
+        UINT32 numFramesPadding = 0;
+        DWORD drainElapsed = 0;
+        while (drainElapsed < DRAIN_TIMEOUT_MS) {
+            Sleep(DRAIN_POLL_MS);
+            drainElapsed += DRAIN_POLL_MS;
+            hr = audioClient->GetCurrentPadding(&numFramesPadding);
+            if (FAILED(hr) || numFramesPadding == 0) break;
         }
 
-        // Wait for all data to finish playing
-        UINT32 numFramesPadding;
-        do {
-            Sleep(10);
-            hr = audioClient->GetCurrentPadding(&numFramesPadding);
-        } while (SUCCEEDED(hr) && numFramesPadding > 0);
-
-        // Wait for device buffer to drain
         Sleep(DRAIN_WAIT_MS);
 
-        // Stop playback
         audioClient->Stop();
         success = true;
 
@@ -832,13 +875,13 @@ static AppConfig LoadConfig() {
     AppConfig config;
 
     wchar_t exePath[MAX_PATH] = {};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (pathLen == 0 || pathLen >= MAX_PATH) return config;
 
-    wchar_t* lastSlash = wcsrchr(exePath, L'\\');
-    if (!lastSlash) return config;
-    *(lastSlash + 1) = L'\0';
+    if (!PathRemoveFileSpecW(exePath)) return config;
 
     std::wstring dir(exePath);
+    dir += L'\\';
     ParseTomlFile((dir + L"minply.toml").c_str(), config);
     ParseTomlFile((dir + L"minply.local.toml").c_str(), config);
 
@@ -846,14 +889,12 @@ static AppConfig LoadConfig() {
 }
 
 int wmain(int argc, wchar_t* argv[]) {
-    // Validate argument count
     if (argc > 2) {
         PrintError("Invalid arguments");
         std::cerr << "Usage: minply.exe [audio file path | -]" << std::endl;
         return ERR_INVALID_ARGS;
     }
 
-    // Load configuration
     AppConfig config = LoadConfig();
 
     // Load audio data into buffer
@@ -910,14 +951,12 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // Initialize COM
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         PrintError("Failed to initialize COM");
         return ERR_WASAPI_INIT;
     }
 
-    // Initialize Media Foundation
     hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
         PrintError("Failed to initialize Media Foundation");
@@ -927,7 +966,6 @@ int wmain(int argc, wchar_t* argv[]) {
 
     int exitCode = EXIT_SUCCESS;
 
-    // Get device mix format
     WAVEFORMATEX* mixFormat = nullptr;
     if (!GetDeviceMixFormat(&mixFormat)) {
         PrintError("Failed to get device format");
@@ -935,25 +973,23 @@ int wmain(int argc, wchar_t* argv[]) {
         MFShutdown();
     }
     else {
-        const BYTE* buf = inputData.data();
-        size_t sz = inputData.size();
+        const BYTE* inputBytes = inputData.data();
+        size_t inputSize = inputData.size();
 
-        // Decode audio buffer
         std::vector<float> decodedData;
         bool decoded = false;
 
         // Dispatch by magic bytes to avoid unnecessary decoder attempts
-        if (sz >= 12 && memcmp(buf, "RIFF", 4) == 0 && memcmp(buf + 8, "WAVE", 4) == 0) {
-            decoded = TryReadWavBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        if (inputSize >= 12 && memcmp(inputBytes, "RIFF", 4) == 0 && memcmp(inputBytes + 8, "WAVE", 4) == 0) {
+            decoded = TryReadWavBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
         }
-        if (!decoded && sz >= 4 && memcmp(buf, "OggS", 4) == 0) {
-            decoded = TryDecodeOpusBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+        if (!decoded && inputSize >= 4 && memcmp(inputBytes, "OggS", 4) == 0) {
+            decoded = TryDecodeOpusBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
         }
         if (!decoded) {
-            decoded = DecodeAudioBuffer(buf, sz, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+            decoded = DecodeAudioBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
         }
 
-        // MF is no longer needed after decode
         MFShutdown();
 
         if (!decoded) {
@@ -961,16 +997,13 @@ int wmain(int argc, wchar_t* argv[]) {
             exitCode = ERR_DECODE_FAILED;
         }
         else {
-            // Normalize perceived loudness (EBU R128) to unify volume across sources
             if (config.loudnessEnabled) {
                 NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
                                   config.loudnessTarget, config.loudnessPeakCeiling);
             }
 
-            // Apply fade to prevent click noise
             ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 
-            // Generate BLE guard tone buffers
             std::vector<float> leadIn, leadOut;
             if (config.guardEnabled) {
                 leadIn = GenerateBleGuard(mixFormat->nSamplesPerSec, mixFormat->nChannels,
@@ -979,7 +1012,6 @@ int wmain(int argc, wchar_t* argv[]) {
                                            config.leadOutDuration, config.guardFrequency, config.guardAmplitude);
             }
 
-            // Play with BLE guard tones to prevent BLE device from entering power-saving mode
             if (!PlayAudio(decodedData, mixFormat, leadIn, leadOut)) {
                 PrintError("Failed to play audio");
                 exitCode = ERR_PLAYBACK_FAILED;
