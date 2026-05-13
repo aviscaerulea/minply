@@ -72,6 +72,7 @@ constexpr DWORD BUFFER_WAIT_MS = 100;      // Buffer wait time in milliseconds
 constexpr DWORD DRAIN_WAIT_MS = 300;       // Wait time for device buffer drain in milliseconds
 constexpr DWORD DRAIN_POLL_MS = 10;        // Polling interval while draining the WASAPI buffer
 constexpr DWORD DRAIN_TIMEOUT_MS = 5000;   // Hard cap on drain polling to prevent infinite loops on stuck devices
+constexpr int   RENDER_MAX_STALL_ITERATIONS = 100;  // ~10s of consecutive WAIT_TIMEOUT wakeups (100 * BUFFER_WAIT_MS) before aborting
 
 // PCM integer-to-float scale factors (2^(bits-1))
 constexpr float PCM16_SCALE = 32768.0f;        // 2^15
@@ -81,7 +82,10 @@ constexpr float PCM32_SCALE = 2147483648.0f;   // 2^31
 // Opus decoder parameters
 constexpr int  OPUS_OUTPUT_RATE     = 48000;   // Opus always decodes at 48kHz internally
 constexpr int  OPUS_MAX_FRAME_SIZE  = 5760;    // 120ms at 48kHz; the largest frame opus_decode_float emits
-constexpr int  OPUS_MAX_CHANNELS    = 8;       // Upper bound used for output buffer sizing
+constexpr int  OPUS_MAX_CHANNELS    = 8;       // Upper bound used for Opus pcmBuffer sizing
+
+// WAV decoder parameters
+constexpr WORD WAV_MAX_CHANNELS     = 8;       // WAVEFORMATEX channel upper bound accepted by this decoder
 
 // I/O chunk sizes
 constexpr size_t STDIN_INITIAL_RESERVE = 1024 * 1024;  // Pre-reserve to avoid reallocation for typical notification sounds
@@ -197,7 +201,7 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
 
     if (actualFormatTag != WAVE_FORMAT_PCM && actualFormatTag != WAVE_FORMAT_IEEE_FLOAT) return false;
     // Reject malformed headers that would later trigger divide-by-zero or oversized allocations
-    if (fmt.Format.nChannels == 0 || fmt.Format.nChannels > OPUS_MAX_CHANNELS) return false;
+    if (fmt.Format.nChannels == 0 || fmt.Format.nChannels > WAV_MAX_CHANNELS) return false;
     if (fmt.Format.nSamplesPerSec == 0) return false;
     if (fmt.Format.wBitsPerSample == 0 || (fmt.Format.wBitsPerSample % 8) != 0) return false;
     if (fmt.Format.nSamplesPerSec != targetSampleRate) return false;
@@ -335,7 +339,10 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
     // Opus stream structure: packet 1 = OpusHead, packet 2 = OpusTags, packet 3+ = audio data
     while (ogg_sync_pageout(&oy, &og) == 1) {
         if (!streamInitialized) {
-            ogg_stream_init(&os, ogg_page_serialno(&og));
+            if (ogg_stream_init(&os, ogg_page_serialno(&og)) != 0) {
+                ogg_sync_clear(&oy);
+                return false;
+            }
             streamInitialized = true;
         }
         ogg_stream_pagein(&os, &og);
@@ -347,7 +354,9 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
                 // OpusHead packet carries channel count and reserves the codec context for audio packets
                 if (op.bytes >= 19 && memcmp(op.packet, "OpusHead", 8) == 0) {
                     opusChannels = op.packet[9];
-                    if (opusChannels < 1 || opusChannels > OPUS_MAX_CHANNELS) {
+                    // Channel mapping family != 0 needs opus_multistream_decoder; reject and limit family 0 to mono/stereo per RFC 7845
+                    int channelMappingFamily = op.packet[18];
+                    if (channelMappingFamily != 0 || opusChannels < 1 || opusChannels > 2) {
                         if (streamInitialized) ogg_stream_clear(&os);
                         ogg_sync_clear(&oy);
                         return false;
@@ -476,6 +485,12 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
                 if (sample) sample->Release();
                 break;
             }
+            // A mid-stream media-type change would force mixing samples of different formats; discard partial data and fail
+            if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
+                if (sample) sample->Release();
+                decodedData.clear();
+                break;
+            }
 
             if (sample) {
                 IMFMediaBuffer* buffer = nullptr;
@@ -587,7 +602,10 @@ void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 
     if (!state) return;
 
     size_t frames = audioData.size() / channels;
-    ebur128_add_frames_float(state, audioData.data(), frames);
+    if (ebur128_add_frames_float(state, audioData.data(), frames) != EBUR128_SUCCESS) {
+        ebur128_destroy(&state);
+        return;
+    }
 
     double loudness = 0.0;
     int result = ebur128_loudness_global(state, &loudness);
@@ -712,9 +730,18 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             size_t totalFrames = source->size() / channels;
             size_t frameIndex = 0;
 
+            // Stall detection based on consecutive WAIT_TIMEOUT wakeups (event auto-reset guarantees ~BUFFER_WAIT_MS per timeout)
+            int stallCount = 0;
             while (frameIndex < totalFrames) {
                 DWORD waitResult = WaitForSingleObject(eventHandle, BUFFER_WAIT_MS);
-                if (waitResult == WAIT_TIMEOUT) continue;
+                if (waitResult == WAIT_TIMEOUT) {
+                    if (++stallCount >= RENDER_MAX_STALL_ITERATIONS) {
+                        PrintError("Audio device stopped responding");
+                        playbackAborted = true;
+                        break;
+                    }
+                    continue;
+                }
                 // Any non-signaled return (WAIT_FAILED / WAIT_ABANDONED) means the audio thread is no longer
                 // pumping; treat this as a hard failure rather than letting the outer loop report success.
                 if (waitResult != WAIT_OBJECT_0) {
@@ -753,22 +780,32 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
                 }
 
                 frameIndex += framesToWrite;
+                stallCount = 0;
             }
             if (playbackAborted) break;
         }
-        if (playbackAborted) break;
+        if (playbackAborted) {
+            audioClient->Stop();
+            break;
+        }
 
         // Wait for buffered samples to actually play out, with a hard cap so a stuck device cannot hang the process
         UINT32 numFramesPadding = 0;
         DWORD drainElapsed = 0;
+        bool drainedCleanly = false;
         while (drainElapsed < DRAIN_TIMEOUT_MS) {
             Sleep(DRAIN_POLL_MS);
             drainElapsed += DRAIN_POLL_MS;
             hr = audioClient->GetCurrentPadding(&numFramesPadding);
-            if (FAILED(hr) || numFramesPadding == 0) break;
+            if (FAILED(hr)) break;
+            if (numFramesPadding == 0) {
+                drainedCleanly = true;
+                break;
+            }
         }
 
-        Sleep(DRAIN_WAIT_MS);
+        // Only honor the trailing pad when drain completed normally; skip it on timeout to avoid compounding the delay
+        if (drainedCleanly) Sleep(DRAIN_WAIT_MS);
 
         audioClient->Stop();
         success = true;
@@ -797,6 +834,15 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     DWORD fileSize = GetFileSize(hFile, nullptr);
     if (fileSize == INVALID_FILE_SIZE) {
         CloseHandle(hFile);
+        return false;
+    }
+    // Hard cap to keep a hostile or accidental huge TOML from exhausting memory
+    constexpr DWORD MAX_TOML_SIZE = 1024 * 1024;
+    if (fileSize > MAX_TOML_SIZE) {
+        CloseHandle(hFile);
+        char nameBuf[MAX_PATH] = {};
+        WideCharToMultiByte(CP_UTF8, 0, PathFindFileNameW(path), -1, nameBuf, sizeof(nameBuf), nullptr, nullptr);
+        std::cerr << "Warning: " << nameBuf << ": config file too large; ignored" << std::endl;
         return false;
     }
     std::string content(fileSize, '\0');
@@ -846,23 +892,29 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             else if (val == "false") dest = false;
             else std::cerr << "Warning: config line " << lineNum << ": invalid bool '" << val << "'" << std::endl;
         };
-        auto parseFloat = [&](float& dest) {
+        // Parse and range-check a float value.
+        // Rejects non-finite values and values outside [minVal, maxVal]; keeps the existing default on failure.
+        auto parseFloat = [&](float& dest, float minVal, float maxVal) {
             char* end;
             float v = strtof(val.c_str(), &end);
-            if (end != val.c_str()) dest = v;
-            else std::cerr << "Warning: config line " << lineNum << ": invalid float '" << val << "'" << std::endl;
+            if (end == val.c_str() || !std::isfinite(v) || v < minVal || v > maxVal) {
+                std::cerr << "Warning: config line " << lineNum << ": invalid value '" << val << "'" << std::endl;
+                return;
+            }
+            dest = v;
         };
 
         if (section == "guard") {
             if      (key == "enabled")          parseBool(config.guardEnabled);
-            else if (key == "frequency")        parseFloat(config.guardFrequency);
-            else if (key == "amplitude")        parseFloat(config.guardAmplitude);
-            else if (key == "lead_in_duration") parseFloat(config.leadInDuration);
-            else if (key == "lead_out_duration") parseFloat(config.leadOutDuration);
-        } else if (section == "loudness") {
+            else if (key == "frequency")        parseFloat(config.guardFrequency, 20.0f, 20000.0f);
+            else if (key == "amplitude")        parseFloat(config.guardAmplitude, 0.0f, 1.0f);
+            else if (key == "lead_in_duration") parseFloat(config.leadInDuration, 0.0f, 10.0f);
+            else if (key == "lead_out_duration") parseFloat(config.leadOutDuration, 0.0f, 10.0f);
+        }
+        else if (section == "loudness") {
             if      (key == "enabled")      parseBool(config.loudnessEnabled);
-            else if (key == "target")       parseFloat(config.loudnessTarget);
-            else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling);
+            else if (key == "target")       parseFloat(config.loudnessTarget, -70.0f, 0.0f);
+            else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling, 0.001f, 1.0f);
         }
     }
     return true;
@@ -928,9 +980,14 @@ int wmain(int argc, wchar_t* argv[]) {
             return ERR_FILE_NOT_FOUND;
         }
         LARGE_INTEGER fileSize;
-        if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart == 0) {
+        if (!GetFileSizeEx(hFile, &fileSize)) {
             CloseHandle(hFile);
-            PrintError("File not found");
+            PrintError("Failed to read file");
+            return ERR_FILE_NOT_FOUND;
+        }
+        if (fileSize.QuadPart == 0) {
+            CloseHandle(hFile);
+            PrintError("File is empty");
             return ERR_FILE_NOT_FOUND;
         }
         // Guard against 4GB+ files: ReadFile takes DWORD, and notification sounds
