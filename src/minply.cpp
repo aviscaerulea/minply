@@ -4,12 +4,14 @@
  * Lightweight and fast audio player with BLE receiver lag compensation
  *
  * Usage:
- *   minply.exe [audio file path | -]
+ *   minply.exe [--session <id>] [audio file path | -]
  *
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
  *   - Accepts audio data from stdin (no argument or - as argument)
  *   - Plays inaudible 19kHz guard tone before/after audio (BLE anti-clipping)
+ *   - --session <id> keeps a linger server alive so consecutive playbacks of the
+ *     same session skip the lead-in entirely (uninterrupted guard tone)
  *   - Exits immediately after playback completes
  *
  * Dependencies:
@@ -40,6 +42,10 @@
 #include <cmath>
 #include <string>
 #include <cstdlib>
+#include <cstdint>
+#include <atomic>
+#include <utility>
+#include <new>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -92,6 +98,41 @@ constexpr size_t STDIN_INITIAL_RESERVE = 1024 * 1024;  // Pre-reserve to avoid r
 constexpr size_t STDIN_READ_CHUNK      = 65536;
 constexpr size_t OGG_FEED_CHUNK        = 65536;
 
+// Linger server (--session) parameters
+constexpr float  LINGER_DURATION          = 30.0f;   // Keep-alive seconds after the last playback
+constexpr DWORD  PIPE_CONNECT_RETRY_MS    = 50;      // Client retry interval while the server pipe is absent
+constexpr DWORD  CLIENT_SPAWN_DEADLINE_MS = 5000;    // Give up waiting for a newly spawned server after this
+constexpr DWORD  CLIENT_QUEUE_DEADLINE_MS = 120000;  // Give up waiting behind other queued playbacks after this
+constexpr DWORD  PIPE_BUFFER_HINT         = 65536;   // Named pipe in/out buffer size hint
+constexpr DWORD  PIPE_IO_TIMEOUT_MS       = 30000;   // Per-operation cap so a dead client cannot block the server forever
+constexpr size_t PIPE_CHUNK               = 65536;   // Transfer chunk size over the session pipe
+constexpr size_t SESSION_ID_MAX           = 64;      // Session id length cap (kernel object name safety)
+constexpr uint64_t PIPE_MAX_DATA          = 256ULL * 1024 * 1024;  // Request payload cap; far above any notification sound, keeps a hostile client from forcing huge allocations
+constexpr DWORD  CLIENT_RESPONSE_TIMEOUT_MS = 600000;  // Client-side cap on waiting for its own playback result (covers long audio)
+constexpr DWORD  SERVER_PLAY_MARGIN_MS    = 30000;   // Extra wait margin for the render thread to finish one audio
+constexpr DWORD  CONNECT_POLL_MS          = 100;     // Slice length while waiting for a client, so device loss is noticed promptly
+constexpr DWORD  RENDER_JOIN_TIMEOUT_MS   = 10000;   // Hard cap on waiting for the render thread during shutdown
+constexpr DWORD  SERVER_INIT_TIMEOUT_MS   = 15000;   // Cap on render-thread startup; a WASAPI call that hangs must not strand connected clients
+
+// Session pipe protocol
+constexpr char     PIPE_MAGIC[4]      = { 'M', 'P', 'R', 'Q' };  // "minply request"; guards against a foreign writer on the pipe
+constexpr uint32_t PIPE_PROTO_VERSION = 1;       // Bump whenever the header layout or the request/ack/response exchange changes
+constexpr BYTE     PIPE_ACK_BYTE      = 0x01;    // Sent once the request is fully read; tells the client the audio is now the server's responsibility
+
+// Request header sent by the client, followed by dataSize bytes of encoded audio
+#pragma pack(push, 1)
+struct PipeRequestHeader {
+    char     magic[4];
+    uint32_t version;
+    uint64_t dataSize;
+};
+
+// Playback result returned by the server after the audio has finished
+struct PipeResponse {
+    int32_t exitCode;
+};
+#pragma pack(pop)
+
 // Application configuration
 //
 // Loaded from minply.toml / minply.local.toml in the executable directory.
@@ -105,11 +146,34 @@ struct AppConfig {
     bool  loudnessEnabled     = true;
     float loudnessTarget      = LOUDNESS_TARGET;
     float loudnessPeakCeiling = LOUDNESS_PEAK_CEILING;
+    float lingerDuration      = LINGER_DURATION;
 };
 
 // Print error message to stderr
 void PrintError(const char* message) {
     std::cerr << "Error: " << message << std::endl;
+}
+
+// Validate a session id
+//
+// The id becomes part of a kernel pipe name, so only unreserved characters are
+// accepted. A Claude Code session_id (UUID) fits within these limits.
+static bool IsValidSessionId(const wchar_t* id) {
+    size_t len = wcslen(id);
+    if (len == 0 || len > SESSION_ID_MAX) return false;
+
+    for (size_t i = 0; i < len; i++) {
+        wchar_t c = id[i];
+        bool ok = (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z')
+               || (c >= L'0' && c <= L'9') || c == L'.' || c == L'_' || c == L'-';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// Build the named pipe path for a session id
+static std::wstring PipeName(const wchar_t* id) {
+    return std::wstring(L"\\\\.\\pipe\\minply-") + id;
 }
 
 // Get device mix format from WASAPI
@@ -525,6 +589,27 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
     return success;
 }
 
+// Decode encoded audio bytes into float PCM at the device mix format
+//
+// Dispatches by magic bytes (WAV -> Opus/Ogg -> Media Foundation fallback) to
+// avoid paying for decoder attempts that cannot succeed.
+static bool DecodeInput(const BYTE* data, size_t size, const WAVEFORMATEX* mixFormat,
+                        std::vector<float>& decodedData) {
+    bool decoded = false;
+
+    if (size >= 12 && memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WAVE", 4) == 0) {
+        decoded = TryReadWavBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+    }
+    if (!decoded && size >= 4 && memcmp(data, "OggS", 4) == 0) {
+        decoded = TryDecodeOpusBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+    }
+    if (!decoded) {
+        decoded = DecodeAudioBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+    }
+
+    return decoded;
+}
+
 // Read all binary data from stdin into buffer
 //
 // Only reads when stdin is a pipe or redirected file to avoid blocking on
@@ -648,74 +733,116 @@ void ApplyFade(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels
     }
 }
 
-// Play audio using WASAPI
-bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
-               const std::vector<float>& leadIn = {},
-               const std::vector<float>& leadOut = {}) {
-    HRESULT hr;
-    IMMDeviceEnumerator* deviceEnumerator = nullptr;
-    IMMDevice* device = nullptr;
-    IAudioClient* audioClient = nullptr;
-    IAudioRenderClient* renderClient = nullptr;
-    HANDLE eventHandle = nullptr;
-    bool success = false;
+// Apply loudness normalization (if enabled) and fade in/out to decoded audio
+static void PostProcess(std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
+                        const AppConfig& config) {
+    if (config.loudnessEnabled) {
+        NormalizeLoudness(audioData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
+                          config.loudnessTarget, config.loudnessPeakCeiling);
+    }
+    ApplyFade(audioData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+}
 
-    UINT32 channels = mixFormat->nChannels;
+// Bundled WASAPI render objects for a single shared-mode session
+struct RenderSession {
+    IMMDeviceEnumerator* enumerator   = nullptr;
+    IMMDevice*           device       = nullptr;
+    IAudioClient*        audioClient  = nullptr;
+    IAudioRenderClient*  renderClient = nullptr;
+    HANDLE               eventHandle  = nullptr;
+    UINT32               bufferFrames = 0;
+};
+
+// Release all objects held by the session (idempotent)
+static void CloseRenderSession(RenderSession& s) {
+    if (s.renderClient) { s.renderClient->Release(); s.renderClient = nullptr; }
+    if (s.audioClient)  { s.audioClient->Release();  s.audioClient = nullptr; }
+    if (s.device)       { s.device->Release();       s.device = nullptr; }
+    if (s.enumerator)   { s.enumerator->Release();   s.enumerator = nullptr; }
+    if (s.eventHandle)  { CloseHandle(s.eventHandle); s.eventHandle = nullptr; }
+    s.bufferFrames = 0;
+}
+
+// Open a shared-mode event-driven render session on the default device
+//
+// On failure prints an error and releases partially acquired objects.
+static bool OpenRenderSession(RenderSession& s, const WAVEFORMATEX* mixFormat) {
+    HRESULT hr;
 
     do {
         hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                              __uuidof(IMMDeviceEnumerator), (void**)&deviceEnumerator);
+                              __uuidof(IMMDeviceEnumerator), (void**)&s.enumerator);
         if (FAILED(hr)) {
             PrintError("Failed to create device enumerator");
             break;
         }
 
-        hr = deviceEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        hr = s.enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &s.device);
         if (FAILED(hr)) {
             PrintError("Failed to get default audio device");
             break;
         }
 
-        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
+        hr = s.device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&s.audioClient);
         if (FAILED(hr)) {
             PrintError("Failed to activate audio client");
             break;
         }
 
-        eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-        if (!eventHandle) {
+        s.eventHandle = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (!s.eventHandle) {
             PrintError("Failed to create event");
             break;
         }
 
-        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                     AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                     0, 0, mixFormat, nullptr);
+        hr = s.audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                       AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                       0, 0, mixFormat, nullptr);
         if (FAILED(hr)) {
             PrintError("Failed to initialize audio client");
             break;
         }
 
-        hr = audioClient->SetEventHandle(eventHandle);
+        hr = s.audioClient->SetEventHandle(s.eventHandle);
         if (FAILED(hr)) {
             PrintError("Failed to set event handle");
             break;
         }
 
-        UINT32 bufferFrameCount;
-        hr = audioClient->GetBufferSize(&bufferFrameCount);
+        hr = s.audioClient->GetBufferSize(&s.bufferFrames);
         if (FAILED(hr)) {
             PrintError("Failed to get buffer size");
             break;
         }
 
-        hr = audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&renderClient);
+        hr = s.audioClient->GetService(__uuidof(IAudioRenderClient), (void**)&s.renderClient);
         if (FAILED(hr)) {
             PrintError("Failed to get render client");
             break;
         }
 
-        hr = audioClient->Start();
+        return true;
+
+    } while (false);
+
+    CloseRenderSession(s);
+    return false;
+}
+
+// Play audio using WASAPI
+bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
+               const std::vector<float>& leadIn = {},
+               const std::vector<float>& leadOut = {}) {
+    HRESULT hr;
+    RenderSession session;
+    bool success = false;
+
+    UINT32 channels = mixFormat->nChannels;
+
+    do {
+        if (!OpenRenderSession(session, mixFormat)) break;
+
+        hr = session.audioClient->Start();
         if (FAILED(hr)) {
             PrintError("Failed to start audio client");
             break;
@@ -733,7 +860,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             // Stall detection based on consecutive WAIT_TIMEOUT wakeups (event auto-reset guarantees ~BUFFER_WAIT_MS per timeout)
             int stallCount = 0;
             while (frameIndex < totalFrames) {
-                DWORD waitResult = WaitForSingleObject(eventHandle, BUFFER_WAIT_MS);
+                DWORD waitResult = WaitForSingleObject(session.eventHandle, BUFFER_WAIT_MS);
                 if (waitResult == WAIT_TIMEOUT) {
                     if (++stallCount >= RENDER_MAX_STALL_ITERATIONS) {
                         PrintError("Audio device stopped responding");
@@ -750,13 +877,13 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
                 }
 
                 UINT32 numFramesPadding;
-                hr = audioClient->GetCurrentPadding(&numFramesPadding);
+                hr = session.audioClient->GetCurrentPadding(&numFramesPadding);
                 if (FAILED(hr)) {
                     playbackAborted = true;
                     break;
                 }
 
-                UINT32 numFramesAvailable = bufferFrameCount - numFramesPadding;
+                UINT32 numFramesAvailable = session.bufferFrames - numFramesPadding;
                 if (numFramesAvailable == 0) continue;
 
                 UINT32 framesToWrite = static_cast<UINT32>(
@@ -764,7 +891,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
                 );
 
                 BYTE* buffer;
-                hr = renderClient->GetBuffer(framesToWrite, &buffer);
+                hr = session.renderClient->GetBuffer(framesToWrite, &buffer);
                 if (FAILED(hr)) {
                     playbackAborted = true;
                     break;
@@ -773,7 +900,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
                 size_t byteCount = framesToWrite * mixFormat->nBlockAlign;
                 memcpy(buffer, &(*source)[frameIndex * channels], byteCount);
 
-                hr = renderClient->ReleaseBuffer(framesToWrite, 0);
+                hr = session.renderClient->ReleaseBuffer(framesToWrite, 0);
                 if (FAILED(hr)) {
                     playbackAborted = true;
                     break;
@@ -785,7 +912,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             if (playbackAborted) break;
         }
         if (playbackAborted) {
-            audioClient->Stop();
+            session.audioClient->Stop();
             break;
         }
 
@@ -796,7 +923,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
         while (drainElapsed < DRAIN_TIMEOUT_MS) {
             Sleep(DRAIN_POLL_MS);
             drainElapsed += DRAIN_POLL_MS;
-            hr = audioClient->GetCurrentPadding(&numFramesPadding);
+            hr = session.audioClient->GetCurrentPadding(&numFramesPadding);
             if (FAILED(hr)) break;
             if (numFramesPadding == 0) {
                 drainedCleanly = true;
@@ -807,17 +934,12 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
         // Only honor the trailing pad when drain completed normally; skip it on timeout to avoid compounding the delay
         if (drainedCleanly) Sleep(DRAIN_WAIT_MS);
 
-        audioClient->Stop();
+        session.audioClient->Stop();
         success = true;
 
     } while (false);
 
-    // Release resources
-    if (renderClient) renderClient->Release();
-    if (audioClient) audioClient->Release();
-    if (device) device->Release();
-    if (deviceEnumerator) deviceEnumerator->Release();
-    if (eventHandle) CloseHandle(eventHandle);
+    CloseRenderSession(session);
 
     return success;
 }
@@ -916,6 +1038,9 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             else if (key == "target")       parseFloat(config.loudnessTarget, -70.0f, 0.0f);
             else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling, 0.001f, 1.0f);
         }
+        else if (section == "linger") {
+            if (key == "duration") parseFloat(config.lingerDuration, 1.0f, 600.0f);
+        }
     }
     return true;
 }
@@ -940,35 +1065,774 @@ static AppConfig LoadConfig() {
     return config;
 }
 
+// Read exactly size bytes from an overlapped pipe handle
+//
+// Both pipe ends are opened with FILE_FLAG_OVERLAPPED, so every transfer needs
+// an OVERLAPPED structure. timeoutMs bounds the whole operation (not one chunk),
+// so a peer trickling bytes cannot hold the connection indefinitely.
+static bool PipeReadExact(HANDLE pipe, void* buf, size_t size, DWORD timeoutMs) {
+    BYTE* dst = static_cast<BYTE*>(buf);
+    size_t done = 0;
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+
+    HANDLE ev = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) return false;
+
+    bool result = true;
+    while (done < size) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) { result = false; break; }
+
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        ResetEvent(ev);
+
+        DWORD toRead = static_cast<DWORD>((std::min)(PIPE_CHUNK, size - done));
+        DWORD got = 0;
+        bool ok = false;
+
+        if (ReadFile(pipe, dst + done, toRead, &got, &ov)) {
+            ok = true;
+        }
+        else if (GetLastError() == ERROR_IO_PENDING) {
+            DWORD remaining = static_cast<DWORD>(deadline - now);
+            if (WaitForSingleObject(ev, remaining) == WAIT_OBJECT_0) {
+                ok = GetOverlappedResult(pipe, &ov, &got, FALSE) != 0;
+            }
+            else {
+                // Reclaim the buffer before it goes out of scope
+                CancelIo(pipe);
+                GetOverlappedResult(pipe, &ov, &got, TRUE);
+            }
+        }
+
+        if (!ok || got == 0) { result = false; break; }
+        done += got;
+    }
+
+    CloseHandle(ev);
+    return result;
+}
+
+// Write all bytes to an overlapped pipe handle
+//
+// Mirrors PipeReadExact: overlapped transfer with timeoutMs bounding the whole
+// operation, keeping a dead or stalled peer from blocking this process.
+static bool PipeWriteAll(HANDLE pipe, const void* buf, size_t size, DWORD timeoutMs) {
+    const BYTE* src = static_cast<const BYTE*>(buf);
+    size_t done = 0;
+    ULONGLONG deadline = GetTickCount64() + timeoutMs;
+
+    HANDLE ev = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) return false;
+
+    bool result = true;
+    while (done < size) {
+        ULONGLONG now = GetTickCount64();
+        if (now >= deadline) { result = false; break; }
+
+        OVERLAPPED ov = {};
+        ov.hEvent = ev;
+        ResetEvent(ev);
+
+        DWORD toWrite = static_cast<DWORD>((std::min)(PIPE_CHUNK, size - done));
+        DWORD put = 0;
+        bool ok = false;
+
+        if (WriteFile(pipe, src + done, toWrite, &put, &ov)) {
+            ok = true;
+        }
+        else if (GetLastError() == ERROR_IO_PENDING) {
+            DWORD remaining = static_cast<DWORD>(deadline - now);
+            if (WaitForSingleObject(ev, remaining) == WAIT_OBJECT_0) {
+                ok = GetOverlappedResult(pipe, &ov, &put, FALSE) != 0;
+            }
+            else {
+                CancelIo(pipe);
+                GetOverlappedResult(pipe, &ov, &put, TRUE);
+            }
+        }
+
+        if (!ok || put == 0) { result = false; break; }
+        done += put;
+    }
+
+    CloseHandle(ev);
+    return result;
+}
+
+// Get the id string of the current default render endpoint
+//
+// WASAPI does not invalidate an existing stream when the default device merely
+// changes (only when the endpoint disappears), so the linger server compares
+// this id per request to notice a switch. Returns an empty string on failure.
+static std::wstring GetDefaultEndpointId() {
+    std::wstring id;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)&enumerator))) {
+        if (SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+            LPWSTR raw = nullptr;
+            if (SUCCEEDED(device->GetId(&raw))) {
+                id = raw;
+                CoTaskMemFree(raw);
+            }
+        }
+    }
+
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    return id;
+}
+
+// Check that the mix format is 32-bit IEEE float PCM with packed frames
+//
+// The render thread writes float samples assuming nBlockAlign == channels * 4;
+// any other layout would overrun the WASAPI buffer, so refuse it up front.
+static bool IsFloat32MixFormat(const WAVEFORMATEX* f) {
+    // Zero channels or rate would divide by zero downstream, and a zero
+    // nBlockAlign would otherwise satisfy the layout check below
+    if (f->nChannels == 0 || f->nSamplesPerSec == 0) return false;
+    if (f->wBitsPerSample != 32) return false;
+    if (f->nBlockAlign != f->nChannels * sizeof(float)) return false;
+    if (f->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) return true;
+    if (f->wFormatTag == WAVE_FORMAT_EXTENSIBLE && f->cbSize >= 22) {
+        // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, spelled out to avoid the ksmedia.h dependency
+        static const GUID ieeeFloat =
+            { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 } };
+        const WAVEFORMATEXTENSIBLE* ext = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(f);
+        return memcmp(&ext->SubFormat, &ieeeFloat, sizeof(GUID)) == 0;
+    }
+    return false;
+}
+
+// Shared state between the pipe thread (server main) and the render thread
+struct ServerState {
+    CRITICAL_SECTION    cs;
+    std::vector<float>  pending;               // Decoded audio waiting to be picked up (guarded by cs)
+    bool                hasPending = false;    // (guarded by cs)
+    HANDLE              doneEvent  = nullptr;  // Auto-reset; signaled once per handed-off audio
+    HANDLE              readyEvent = nullptr;  // Manual-reset; signaled after render init succeeds or fails
+    int                 playResult = EXIT_SUCCESS;  // Result of the last audio; written before doneEvent
+    UINT32              bufferFrames = 0;      // WASAPI buffer size; valid after readyEvent
+    std::atomic<bool>   renderOk{false};
+    std::atomic<bool>   stopRequested{false};
+    std::atomic<bool>   deviceLost{false};
+    const WAVEFORMATEX* mixFormat = nullptr;
+    AppConfig           config;
+};
+
+// Render thread: owns one WASAPI stream for the whole server lifetime
+//
+// Fills the buffer with the guard tone while idle (digital silence when the guard
+// is disabled) and switches to queued audio at the next buffer refill, so a waiting
+// playback starts within one buffer period instead of paying a lead-in again.
+// The initial lead-in must elapse before the first audio may start, because the
+// receiver is still asleep when the server has just been spawned.
+static DWORD WINAPI RenderThreadProc(LPVOID param) {
+    ServerState* state = static_cast<ServerState*>(param);
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) {
+        state->renderOk = false;
+        SetEvent(state->readyEvent);
+        return 0;
+    }
+
+    RenderSession session;
+    if (!OpenRenderSession(session, state->mixFormat) || FAILED(session.audioClient->Start())) {
+        CloseRenderSession(session);
+        state->renderOk = false;
+        SetEvent(state->readyEvent);
+        CoUninitialize();
+        return 0;
+    }
+
+    state->bufferFrames = session.bufferFrames;
+    state->renderOk = true;
+    SetEvent(state->readyEvent);
+
+    const UINT32 channels = state->mixFormat->nChannels;
+    const UINT32 rate     = state->mixFormat->nSamplesPerSec;
+    const bool   guardOn  = state->config.guardEnabled;
+    const float  amp      = state->config.guardAmplitude;
+    const float  phaseInc = TWO_PI * state->config.guardFrequency / rate;
+
+    std::vector<float> active;
+    size_t activeFrames = 0;
+    size_t activeIndex  = 0;
+    bool   activePlaying = false;
+    size_t leadInRemain = guardOn ? static_cast<size_t>(rate * state->config.leadInDuration) : 0;
+    float  phase = 0.0f;
+    int    stallCount = 0;
+
+    while (!state->stopRequested) {
+        DWORD waitResult = WaitForSingleObject(session.eventHandle, BUFFER_WAIT_MS);
+        if (waitResult == WAIT_TIMEOUT) {
+            // Consecutive timeouts mean the audio engine stopped pumping this stream
+            if (++stallCount >= RENDER_MAX_STALL_ITERATIONS) {
+                state->deviceLost = true;
+                break;
+            }
+            continue;
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            state->deviceLost = true;
+            break;
+        }
+        stallCount = 0;
+
+        UINT32 padding = 0;
+        if (FAILED(session.audioClient->GetCurrentPadding(&padding))) {
+            state->deviceLost = true;
+            break;
+        }
+
+        UINT32 framesAvail = session.bufferFrames - padding;
+        if (framesAvail == 0) continue;
+
+        // Pick up the next queued audio only once the lead-in has been emitted
+        if (!activePlaying && leadInRemain == 0) {
+            EnterCriticalSection(&state->cs);
+            if (state->hasPending) {
+                active = std::move(state->pending);
+                state->pending.clear();
+                state->hasPending = false;
+                activeFrames  = active.size() / channels;
+                activeIndex   = 0;
+                activePlaying = activeFrames > 0;
+                // An empty result has nothing to render; report success at once
+                // so the pipe thread does not wait out its whole margin
+                if (!activePlaying) {
+                    state->playResult = EXIT_SUCCESS;
+                    SetEvent(state->doneEvent);
+                }
+            }
+            LeaveCriticalSection(&state->cs);
+        }
+
+        BYTE* raw = nullptr;
+        if (FAILED(session.renderClient->GetBuffer(framesAvail, &raw))) {
+            state->deviceLost = true;
+            break;
+        }
+
+        float* out = reinterpret_cast<float*>(raw);
+        for (UINT32 f = 0; f < framesAvail; f++) {
+            if (activePlaying) {
+                for (UINT32 ch = 0; ch < channels; ch++) {
+                    out[f * channels + ch] = active[activeIndex * channels + ch];
+                }
+                activeIndex++;
+                if (activeIndex >= activeFrames) {
+                    // Remaining frames of this refill fall through to the idle tone.
+                    // The amplitude step is inaudible at -60dB, so no phase matching is needed.
+                    activePlaying = false;
+                    active.clear();
+                    state->playResult = EXIT_SUCCESS;
+                    SetEvent(state->doneEvent);
+                }
+            }
+            else {
+                float s = guardOn ? amp * sinf(phase) : 0.0f;
+                for (UINT32 ch = 0; ch < channels; ch++) {
+                    out[f * channels + ch] = s;
+                }
+                phase += phaseInc;
+                if (phase >= TWO_PI) phase -= TWO_PI;
+                if (leadInRemain > 0) leadInRemain--;
+            }
+        }
+
+        if (FAILED(session.renderClient->ReleaseBuffer(framesAvail, 0))) {
+            state->deviceLost = true;
+            break;
+        }
+    }
+
+    // Unblock a caller still waiting on audio that will never finish. Audio
+    // queued but not yet picked up counts too: the stall detector can break out
+    // of the loop without ever reaching the pickup block.
+    EnterCriticalSection(&state->cs);
+    bool orphaned = activePlaying || state->hasPending;
+    state->hasPending = false;
+    state->pending.clear();
+    LeaveCriticalSection(&state->cs);
+
+    if (orphaned) {
+        state->playResult = ERR_PLAYBACK_FAILED;
+        SetEvent(state->doneEvent);
+    }
+
+    session.audioClient->Stop();
+    CloseRenderSession(session);
+    CoUninitialize();
+    return 0;
+}
+
+// Serve playback requests for a session and keep the receiver awake between them
+//
+// Owns the session pipe and one render thread, then shuts down after
+// config.lingerDuration seconds without a client. Creating the pipe with
+// FILE_FLAG_FIRST_PIPE_INSTANCE doubles as the single-server election: a second
+// server for the same id fails here and exits quietly.
+static int RunServer(const wchar_t* sessionId) {
+    AppConfig config = LoadConfig();
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) return ERR_WASAPI_INIT;
+
+    hr = MFStartup(MF_VERSION);
+    if (FAILED(hr)) {
+        CoUninitialize();
+        return ERR_DECODE_FAILED;
+    }
+
+    WAVEFORMATEX* mixFormat = nullptr;
+    if (!GetDeviceMixFormat(&mixFormat)) {
+        MFShutdown();
+        CoUninitialize();
+        return ERR_WASAPI_INIT;
+    }
+    // The render thread writes raw float frames; refuse a device whose mix
+    // format has any other layout instead of corrupting the WASAPI buffer
+    if (!IsFloat32MixFormat(mixFormat)) {
+        CoTaskMemFree(mixFormat);
+        MFShutdown();
+        CoUninitialize();
+        return ERR_WASAPI_INIT;
+    }
+
+    std::wstring pipePath = PipeName(sessionId);
+    HANDLE pipe = CreateNamedPipeW(pipePath.c_str(),
+                                   PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                                   1, PIPE_BUFFER_HINT, PIPE_BUFFER_HINT, 0, nullptr);
+    if (pipe == INVALID_HANDLE_VALUE) {
+        // Another server already owns this session id
+        CoTaskMemFree(mixFormat);
+        MFShutdown();
+        CoUninitialize();
+        return EXIT_SUCCESS;
+    }
+
+    ServerState state;
+    InitializeCriticalSection(&state.cs);
+    state.doneEvent  = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    state.readyEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    state.mixFormat  = mixFormat;
+    state.config     = config;
+
+    int exitCode = EXIT_SUCCESS;
+    HANDLE renderThread = nullptr;
+    HANDLE connEvent = nullptr;
+
+    do {
+        if (!state.doneEvent || !state.readyEvent) {
+            exitCode = ERR_WASAPI_INIT;
+            break;
+        }
+
+        connEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (!connEvent) {
+            exitCode = ERR_WASAPI_INIT;
+            break;
+        }
+
+        renderThread = CreateThread(nullptr, 0, RenderThreadProc, &state, 0, nullptr);
+        if (!renderThread) {
+            exitCode = ERR_WASAPI_INIT;
+            break;
+        }
+
+        // Bound the wait: a WASAPI call that hangs during startup would otherwise
+        // strand clients, which can already connect to the pipe created above
+        if (WaitForSingleObject(state.readyEvent, SERVER_INIT_TIMEOUT_MS) != WAIT_OBJECT_0
+            || !state.renderOk) {
+            exitCode = ERR_WASAPI_INIT;
+            break;
+        }
+
+        const DWORD lingerMs = static_cast<DWORD>(config.lingerDuration * 1000.0f);
+        const std::wstring startupDeviceId = GetDefaultEndpointId();
+
+        while (true) {
+            // Accept the next client, giving up once the linger window expires
+            OVERLAPPED ov = {};
+            ov.hEvent = connEvent;
+            ResetEvent(connEvent);
+
+            bool connected = false;
+            bool shutdown = false;
+
+            if (ConnectNamedPipe(pipe, &ov)) {
+                connected = true;
+            }
+            else {
+                DWORD err = GetLastError();
+                if (err == ERROR_PIPE_CONNECTED) {
+                    connected = true;
+                }
+                else if (err == ERROR_IO_PENDING) {
+                    ULONGLONG deadline = GetTickCount64() + lingerMs;
+                    // Poll in slices so a lost device ends the linger without waiting it out
+                    while (true) {
+                        if (state.deviceLost) { shutdown = true; break; }
+                        ULONGLONG now = GetTickCount64();
+                        if (now >= deadline) { shutdown = true; break; }
+                        ULONGLONG left = deadline - now;
+                        DWORD slice = static_cast<DWORD>((std::min)(static_cast<ULONGLONG>(CONNECT_POLL_MS), left));
+                        DWORD w = WaitForSingleObject(connEvent, slice);
+                        if (w == WAIT_OBJECT_0) { connected = true; break; }
+                        if (w != WAIT_TIMEOUT) { shutdown = true; break; }
+                    }
+                    if (!connected) {
+                        DWORD ignored = 0;
+                        CancelIo(pipe);
+                        GetOverlappedResult(pipe, &ov, &ignored, TRUE);
+                    }
+                }
+                else {
+                    shutdown = true;
+                }
+            }
+
+            if (!connected || shutdown) break;
+
+            // Bail out before taking on work the render thread can no longer do.
+            // No ack has been sent, so the client is free to retry elsewhere.
+            if (state.deviceLost) {
+                DisconnectNamedPipe(pipe);
+                break;
+            }
+
+            // A default-device switch does not invalidate the stream, so compare
+            // endpoint ids per request and shut down on a change. The client's
+            // retry then spawns a fresh server bound to the new device. An empty
+            // id means the lookup failed; treat that as unknown rather than as a
+            // change, which would otherwise recycle the server on every request.
+            std::wstring currentDeviceId = GetDefaultEndpointId();
+            if (!currentDeviceId.empty() && !startupDeviceId.empty()
+                && currentDeviceId != startupDeviceId) {
+                DisconnectNamedPipe(pipe);
+                break;
+            }
+
+            // One request per connection
+            PipeRequestHeader header = {};
+            std::vector<BYTE> payload;
+            bool requestOk = PipeReadExact(pipe, &header, sizeof(header), PIPE_IO_TIMEOUT_MS)
+                          && memcmp(header.magic, PIPE_MAGIC, sizeof(PIPE_MAGIC)) == 0
+                          && header.version == PIPE_PROTO_VERSION
+                          && header.dataSize > 0
+                          && header.dataSize <= PIPE_MAX_DATA;
+            if (requestOk) {
+                try {
+                    payload.resize(static_cast<size_t>(header.dataSize));
+                }
+                catch (const std::bad_alloc&) {
+                    requestOk = false;
+                }
+            }
+            if (requestOk) {
+                requestOk = PipeReadExact(pipe, payload.data(), payload.size(), PIPE_IO_TIMEOUT_MS);
+            }
+            if (!requestOk) {
+                DisconnectNamedPipe(pipe);
+                continue;
+            }
+
+            // Acknowledge before any long work. The client uses this to tell
+            // "never received" (safe to retry) from "accepted and playing"
+            // (retrying would play the same audio twice).
+            if (!PipeWriteAll(pipe, &PIPE_ACK_BYTE, sizeof(PIPE_ACK_BYTE), PIPE_IO_TIMEOUT_MS)) {
+                DisconnectNamedPipe(pipe);
+                continue;
+            }
+
+            PipeResponse response = { EXIT_SUCCESS };
+            bool renderWedged = false;
+            std::vector<float> decoded;
+            bool decoded_ok = false;
+            // Decoding expands compressed audio by a large factor, so a payload
+            // within the request cap can still exhaust memory; fail just this
+            // request instead of letting the server process die
+            try {
+                decoded_ok = DecodeInput(payload.data(), payload.size(), mixFormat, decoded);
+                if (decoded_ok) PostProcess(decoded, mixFormat, config);
+            }
+            catch (const std::bad_alloc&) {
+                decoded_ok = false;
+                decoded.clear();
+            }
+
+            if (!decoded_ok) {
+                response.exitCode = ERR_DECODE_FAILED;
+            }
+            else {
+                size_t frames = decoded.size() / mixFormat->nChannels;
+                DWORD audioMs = static_cast<DWORD>(frames * 1000ULL / mixFormat->nSamplesPerSec);
+
+                EnterCriticalSection(&state.cs);
+                state.pending = std::move(decoded);
+                state.hasPending = true;
+                LeaveCriticalSection(&state.cs);
+
+                DWORD w = WaitForSingleObject(state.doneEvent, audioMs + SERVER_PLAY_MARGIN_MS);
+                if (w != WAIT_OBJECT_0) {
+                    // A timeout leaves the render thread in an unknown state (a late
+                    // doneEvent would corrupt the next request), so stop serving
+                    response.exitCode = ERR_PLAYBACK_FAILED;
+                    renderWedged = true;
+                }
+                else {
+                    // The render thread reports the outcome; losing the device
+                    // afterwards ends the linger but does not undo a finished playback
+                    response.exitCode = state.playResult;
+                    if (state.deviceLost) renderWedged = true;
+
+                    if (response.exitCode == EXIT_SUCCESS) {
+                        // The render thread signals when the last frame is written, so the
+                        // frames still sitting in the device buffer have yet to be heard.
+                        // Hold the client until they drain, preserving the contract that
+                        // minply exits only after its audio finished.
+                        DWORD bufferMs = static_cast<DWORD>(
+                            static_cast<ULONGLONG>(state.bufferFrames) * 1000ULL / mixFormat->nSamplesPerSec);
+                        Sleep(bufferMs + DRAIN_WAIT_MS);
+                    }
+                }
+            }
+
+            if (PipeWriteAll(pipe, &response, sizeof(response), PIPE_IO_TIMEOUT_MS)) {
+                // Wait for the client to read the response and close its end;
+                // disconnecting earlier would discard the unread response, and
+                // FlushFileBuffers has no timeout. The read fails with a broken
+                // pipe once the client closes, bounded by the I/O timeout.
+                BYTE closeProbe = 0;
+                PipeReadExact(pipe, &closeProbe, 1, PIPE_IO_TIMEOUT_MS);
+            }
+            DisconnectNamedPipe(pipe);
+
+            if (renderWedged) break;
+        }
+
+    } while (false);
+
+    // Close the pipe before joining the render thread so a client arriving in
+    // the shutdown window fails to connect immediately and retries against a
+    // freshly spawned server instead of losing its audio
+    CloseHandle(pipe);
+
+    state.stopRequested = true;
+    if (renderThread) {
+        // A render thread stuck past the join timeout still uses this stack's
+        // state; tearing it down would be a use-after-free, so exit hard instead
+        if (WaitForSingleObject(renderThread, RENDER_JOIN_TIMEOUT_MS) != WAIT_OBJECT_0) {
+            TerminateProcess(GetCurrentProcess(), static_cast<UINT>(exitCode));
+        }
+        CloseHandle(renderThread);
+    }
+
+    if (connEvent) CloseHandle(connEvent);
+    if (state.doneEvent) CloseHandle(state.doneEvent);
+    if (state.readyEvent) CloseHandle(state.readyEvent);
+    DeleteCriticalSection(&state.cs);
+    CoTaskMemFree(mixFormat);
+    MFShutdown();
+    CoUninitialize();
+
+    return exitCode;
+}
+
+// Spawn a detached linger server process for the session
+//
+// Re-launches this executable with the internal --serve entry point. Losing a
+// race to another client is harmless: the loser's server exits at once because
+// the pipe it needs already exists.
+static bool SpawnServer(const wchar_t* sessionId) {
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (pathLen == 0 || pathLen >= MAX_PATH) return false;
+
+    std::wstring cmdline = L"\"";
+    cmdline += exePath;
+    cmdline += L"\" --serve ";
+    cmdline += sessionId;
+
+    STARTUPINFOW si = {};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+
+    // DETACHED_PROCESS keeps the server off the caller's console so it outlives
+    // the shell that started it. It must not be combined with CREATE_NO_WINDOW.
+    if (!CreateProcessW(nullptr, &cmdline[0], nullptr, nullptr, FALSE,
+                        DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+        return false;
+    }
+
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return true;
+}
+
+// Connect to the session's server pipe, spawning the server when absent
+//
+// ERROR_PIPE_BUSY means another client is being served, which is how playbacks
+// of one session end up serialized. queueDeadline caps the total queue wait
+// across attempts. Returns INVALID_HANDLE_VALUE once a deadline passes, when
+// the server cannot be spawned, or on any other connect error.
+static HANDLE ConnectToServer(const wchar_t* sessionId, ULONGLONG queueDeadline) {
+    std::wstring pipePath = PipeName(sessionId);
+    ULONGLONG spawnDeadline = GetTickCount64() + CLIENT_SPAWN_DEADLINE_MS;
+    bool spawned = false;
+
+    while (true) {
+        HANDLE pipe = CreateFileW(pipePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) return pipe;
+
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_BUSY) {
+            if (GetTickCount64() > queueDeadline) return INVALID_HANDLE_VALUE;
+            WaitNamedPipeW(pipePath.c_str(), 1000);
+            continue;
+        }
+        if (err == ERROR_FILE_NOT_FOUND) {
+            if (!spawned) {
+                if (!SpawnServer(sessionId)) return INVALID_HANDLE_VALUE;
+                spawned = true;
+                // Start the startup allowance now; time already spent queueing
+                // behind another client must not count against the new server
+                spawnDeadline = GetTickCount64() + CLIENT_SPAWN_DEADLINE_MS;
+            }
+            if (GetTickCount64() > spawnDeadline) return INVALID_HANDLE_VALUE;
+            Sleep(PIPE_CONNECT_RETRY_MS);
+            continue;
+        }
+        return INVALID_HANDLE_VALUE;
+    }
+}
+
+// Hand the audio to the session's linger server and wait for its playback result
+//
+// Retries only while the request is unacknowledged, which covers a server that
+// shuts down between connect and hand-off (linger expiry, device switch). Once
+// the ack arrives the server owns the audio, so a later failure must not retry
+// or the same sound would play twice.
+static int RunClient(const wchar_t* sessionId, const std::vector<BYTE>& inputData) {
+    if (inputData.size() > PIPE_MAX_DATA) {
+        PrintError("Input too large for session playback");
+        return ERR_DECODE_FAILED;
+    }
+
+    PipeRequestHeader header = {};
+    memcpy(header.magic, PIPE_MAGIC, sizeof(PIPE_MAGIC));
+    header.version  = PIPE_PROTO_VERSION;
+    header.dataSize = inputData.size();
+
+    ULONGLONG queueDeadline = GetTickCount64() + CLIENT_QUEUE_DEADLINE_MS;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        HANDLE pipe = ConnectToServer(sessionId, queueDeadline);
+        if (pipe == INVALID_HANDLE_VALUE) continue;
+
+        BYTE ack = 0;
+        bool accepted = PipeWriteAll(pipe, &header, sizeof(header), PIPE_IO_TIMEOUT_MS)
+                     && PipeWriteAll(pipe, inputData.data(), inputData.size(), PIPE_IO_TIMEOUT_MS)
+                     && PipeReadExact(pipe, &ack, sizeof(ack), PIPE_IO_TIMEOUT_MS)
+                     && ack == PIPE_ACK_BYTE;
+        if (!accepted) {
+            CloseHandle(pipe);
+            continue;
+        }
+
+        PipeResponse response = {};
+        bool ok = PipeReadExact(pipe, &response, sizeof(response), CLIENT_RESPONSE_TIMEOUT_MS);
+        CloseHandle(pipe);
+
+        if (!ok) {
+            // The audio was accepted, so it may already be playing
+            PrintError("Lost contact with linger server during playback");
+            return ERR_PLAYBACK_FAILED;
+        }
+
+        // Surface the server-side failure cause; the server has no way to
+        // reach this process's stderr
+        if (response.exitCode == ERR_DECODE_FAILED) PrintError("Failed to decode audio");
+        else if (response.exitCode != EXIT_SUCCESS) PrintError("Failed to play audio");
+        return response.exitCode;
+    }
+
+    PrintError("Failed to communicate with linger server");
+    return ERR_PLAYBACK_FAILED;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
-    if (argc > 2) {
+    const wchar_t* sessionId = nullptr;
+    const wchar_t* serveId   = nullptr;
+    const wchar_t* pathArg   = nullptr;
+    bool argsValid = true;
+
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"--session") == 0) {
+            if (i + 1 >= argc || sessionId) { argsValid = false; break; }
+            sessionId = argv[++i];
+        }
+        else if (wcscmp(argv[i], L"--serve") == 0) {
+            if (i + 1 >= argc || serveId) { argsValid = false; break; }
+            serveId = argv[++i];
+        }
+        else if (!pathArg) {
+            pathArg = argv[i];
+        }
+        else {
+            argsValid = false;
+            break;
+        }
+    }
+
+    if (!argsValid || (sessionId && serveId)) {
         PrintError("Invalid arguments");
-        std::cerr << "Usage: minply.exe [audio file path | -]" << std::endl;
+        std::cerr << "Usage: minply.exe [--session <id>] [audio file path | -]" << std::endl;
         return ERR_INVALID_ARGS;
     }
 
-    AppConfig config = LoadConfig();
+    // Server mode is an internal entry point spawned by the client
+    if (serveId) {
+        if (!IsValidSessionId(serveId)) {
+            PrintError("Invalid session id");
+            return ERR_INVALID_ARGS;
+        }
+        return RunServer(serveId);
+    }
+
+    if (sessionId && !IsValidSessionId(sessionId)) {
+        PrintError("Invalid session id");
+        return ERR_INVALID_ARGS;
+    }
 
     // Load audio data into buffer
     //
     // Argument resolution:
-    //   - argc == 1            : read from stdin if piped, else exit silently
-    //   - argv[1] == "-"       : read from stdin (error if empty)
-    //   - argv[1] == file path : read from file
+    //   - no path argument    : read from stdin if piped, else exit silently
+    //   - path argument "-"   : read from stdin (error if empty)
+    //   - path argument       : read from file
     std::vector<BYTE> inputData;
-    if (argc == 1) {
+    if (!pathArg) {
         if (!ReadAllStdin(inputData)) {
             return EXIT_SUCCESS;
         }
     }
-    else if (wcscmp(argv[1], L"-") == 0) {
+    else if (wcscmp(pathArg, L"-") == 0) {
         if (!ReadAllStdin(inputData)) {
             PrintError("No input data on stdin");
             return ERR_FILE_NOT_FOUND;
         }
     }
     else {
-        const wchar_t* filePath = argv[1];
+        const wchar_t* filePath = pathArg;
         if (GetFileAttributesW(filePath) == INVALID_FILE_ATTRIBUTES) {
             PrintError("File not found");
             return ERR_FILE_NOT_FOUND;
@@ -1008,6 +1872,14 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
+    // Session mode delegates playback to the linger server, which loads its own
+    // configuration; reading it here as well would only duplicate any warnings
+    if (sessionId) {
+        return RunClient(sessionId, inputData);
+    }
+
+    AppConfig config = LoadConfig();
+
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
         PrintError("Failed to initialize COM");
@@ -1029,23 +1901,17 @@ int wmain(int argc, wchar_t* argv[]) {
         exitCode = ERR_WASAPI_INIT;
         MFShutdown();
     }
+    // Playback writes decoded float frames straight into the WASAPI buffer, so
+    // any other layout would read or write past its end
+    else if (!IsFloat32MixFormat(mixFormat)) {
+        PrintError("Unsupported device mix format");
+        exitCode = ERR_WASAPI_INIT;
+        MFShutdown();
+        CoTaskMemFree(mixFormat);
+    }
     else {
-        const BYTE* inputBytes = inputData.data();
-        size_t inputSize = inputData.size();
-
         std::vector<float> decodedData;
-        bool decoded = false;
-
-        // Dispatch by magic bytes to avoid unnecessary decoder attempts
-        if (inputSize >= 12 && memcmp(inputBytes, "RIFF", 4) == 0 && memcmp(inputBytes + 8, "WAVE", 4) == 0) {
-            decoded = TryReadWavBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
-        }
-        if (!decoded && inputSize >= 4 && memcmp(inputBytes, "OggS", 4) == 0) {
-            decoded = TryDecodeOpusBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
-        }
-        if (!decoded) {
-            decoded = DecodeAudioBuffer(inputBytes, inputSize, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
-        }
+        bool decoded = DecodeInput(inputData.data(), inputData.size(), mixFormat, decodedData);
 
         MFShutdown();
 
@@ -1054,12 +1920,7 @@ int wmain(int argc, wchar_t* argv[]) {
             exitCode = ERR_DECODE_FAILED;
         }
         else {
-            if (config.loudnessEnabled) {
-                NormalizeLoudness(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
-                                  config.loudnessTarget, config.loudnessPeakCeiling);
-            }
-
-            ApplyFade(decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
+            PostProcess(decodedData, mixFormat, config);
 
             std::vector<float> leadIn, leadOut;
             if (config.guardEnabled) {
