@@ -1,49 +1,55 @@
 # minply
 
-BLE レシーバの先頭欠損を防止する、通知音など再生用の超軽量 CLI オーディオプレイヤー。
+[![日本語](https://img.shields.io/badge/lang-日本語-red)](README.md)
+[![English](https://img.shields.io/badge/lang-English-blue)](README.en.md)
+[![Release](https://img.shields.io/github/v/release/aviscaerulea/minply)](https://github.com/aviscaerulea/minply/releases/latest)
+[![License](https://img.shields.io/github/license/aviscaerulea/minply)](LICENSE)
+[![Build](https://github.com/aviscaerulea/minply/actions/workflows/release.yml/badge.svg)](https://github.com/aviscaerulea/minply/actions/workflows/release.yml)
+
+通知音や読み上げ音声を鳴らすための、Windows 向け超軽量 CLI オーディオプレイヤーです。
+
+Bluetooth レシーバは無音が続くと省電力状態に入り、次に鳴らした音の先頭を削ってしまいます。minply は人の耳に聞こえない高周波の音を本編の前後に流し続けることで、この先頭欠損を防ぎます。実行ファイルは約 570KB ひとつだけで、追加のランタイムは要りません。
 
 ## 機能
 
-- 単一実行ファイル（約 524KB）、ランタイム依存なし
-- Opus, MP3, WAV, AAC, FLAC, WMA などの形式に対応
-- ファイルパスまたは stdin（`-` または引数省略）からの入力に対応
-- WAV ファイルは可能な場合リサンプリングなしで直接再生（音質劣化なし）
-- Opus ファイル（.opus, .ogg）の高品質再生対応（モノラル／ステレオのみ、channel mapping family 0）
-- EBU R128 ラウドネスノーマライズ（-16 LUFS）によりソースごとの音量差を統一
-- BLE レシーバの省電力モード抑止のための不可聴ガードトーン再生（冒頭 1.2 秒・末尾 1.2 秒）
-- `--session <id>` 指定による常駐で、同一セッションの連続再生をリードインなしで即時開始
-- バックグラウンド実行（コンソールウィンドウなし）
-- WASAPI 共有モードでデフォルトオーディオデバイスに再生
-- 再生完了後に即座に終了
+- 先頭欠損の防止：不可聴音でレシーバを起こしたまま保ち、音の出だしが切れないようにする
+- セッション常駐：連続再生のたびに発生する待ち時間をなくす
+- 幅広い形式：Opus, MP3, WAV, AAC, FLAC, WMA などを再生
+- 標準入力からの再生：ファイルパスの代わりにパイプで音声データを渡せる
+- 単一実行ファイル：インストール不要で、置くだけで動く
+- 即時終了：ウィンドウを出さずに再生し、終わり次第すぐ終了する
 
-## 動作要件
+## インストール
 
-### 実行
+### 動作要件
 
 - Windows 10 version 1607 以降（x64）
-- 追加のソフトウェアは不要（全ての依存関係は Windows に組み込み済み）
+- 追加のソフトウェアは不要（依存関係はすべて Windows に組み込み済み）
 
-## インストール方法
+### 手順
 
-[Scoop](https://scoop.sh/) でインストールできる。
+#### リリースの ZIP から
+
+[リリースページ](https://github.com/aviscaerulea/minply/releases/latest)から `minply-<バージョン>-x64.zip` をダウンロードします。展開して出てくる `minply.exe` を任意のフォルダへ置けば使えます。同梱の `minply.toml` を同じフォルダへ置くと動作を調整できます。
+
+#### Scoop から
+
+[Scoop](https://scoop.sh/) を使う場合は、バケットを追加してインストールします。
 
 ```powershell
 scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install minply
 ```
 
-## 使用方法
+## 使い方
 
 ```
 minply.exe [--session <id>] [オーディオファイル | -]
 ```
 
 ```powershell
-# MP3 ファイルを再生
+# ファイルを再生
 minply.exe notification.mp3
-
-# WAV ファイルを再生
-minply.exe alert.wav
 
 # エラー出力をキャプチャ
 minply.exe notfound.mp3 2>&1 | Out-File error.log
@@ -51,111 +57,87 @@ minply.exe notfound.mp3 2>&1 | Out-File error.log
 
 ### 標準入力からの再生
 
-引数を省略するか `-` を指定すると、stdin からバイナリ音声データを読み込んで再生する。
-stdin がパイプ／リダイレクトされていない状態で引数なしで起動した場合は、何もせず正常終了する。
+引数を省略するか `-` を指定すると、標準入力から音声データを読み込んで再生します。
 
 ```cmd
 :: cmd.exe からのパイプ（引数省略可）
 type alert.mp3 | minply.exe
-type alert.mp3 | minply.exe -
 ```
 
 ```powershell
-# PowerShell 7+ からのパイプ（-AsByteStream が必須）
+# PowerShell 7 以降からのパイプ
 Get-Content -AsByteStream -Raw alert.mp3 | minply.exe
 ```
 
-> **注意：** PowerShell の `Get-Content` はデフォルトでテキストモードで読み込むためバイナリが破損する。
-> パイプで渡す場合は必ず `-AsByteStream` を指定すること（PowerShell 7 以降）。
+> [!IMPORTANT]
+> PowerShell の `Get-Content` は既定でテキストとして読むためバイナリが壊れます。パイプで渡すときは `-AsByteStream` を必ず指定してください（PowerShell 7 以降）。
 
-### セッション常駐モード
+### 連続再生の高速化
 
-`--session <id>` を指定すると、再生後もプロセスが一定時間だけ常駐し、不可聴ガードトーンを流し続けます。
-これによりレシーバがスリープに入らないため、同一 id の次の再生はリードインなしで即時再生します。
+`--session <id>` を付けると、再生後もプロセスがしばらく常駐して不可聴音を流し続けます。レシーバが起きたままになるため、同じ id での次の再生は待ち時間なしで始まります。読み上げ音声を続けて鳴らす用途で効果があります。
 
 ```powershell
-# Claude Code のセッション ID を渡す例
+# セッション ID を渡す例
 minply.exe --session $env:CLAUDE_SESSION_ID speech.wav
 ```
 
-動作は次のとおりです。
+- 初回：常駐プロセスを起動し、レシーバを起こしてから再生
+- 2 回目以降：同じ id なら待ち時間なしで再生
+- 最後の再生から一定時間が過ぎると常駐プロセスは自動で終了
 
-- 初回：常駐プロセスを起動し、リードイン後に再生
-- 2 回目以降：同一 id に限りリードインなしで即時再生
-- 最後の再生完了から `linger.duration` 秒が経過すると常駐プロセスは自動終了
+同じ id への再生要求は 1 つずつ順番に処理し、異なる id は互いに独立して同時に鳴ります。続けて鳴らす音を重ねたくない場合は同じ id を使ってください。
 
-同一 id の再生要求は順番に 1 つずつ処理します。異なる id は互いに独立して並行再生します。
-連続する発話を重ねずに順番どおり鳴らしたい用途では、同一 id を使ってください。
-
-id は半角英数字と `.`、`_`、`-` だけを使った 1〜64 文字とします。条件を満たさない id を渡すと終了コード 1 で終了します。
-
-`--session` を指定しない起動は常駐せず、従来どおり再生後すぐに終了します。
-
-常駐プロセスの起動・通信・オーディオデバイス初期化の失敗は、いずれも終了コード 5 で通知します。
-
-> **注意：** 常駐プロセスは起動時に設定を読み込むため、常駐中の設定ファイルの変更を読み直しません。
-> オーディオデバイスを切り替えると常駐プロセスは終了し、次回の呼び出しで新しいデバイス向けに起動し直します。
+id に使えるのは半角英数字と `.`、`_`、`-` で、長さは 1〜64 文字です。
 
 ### 終了コード
 
 | コード | 説明 |
-|------|------|
+| --- | --- |
 | 0 | 成功 |
 | 1 | 引数が無効 |
-| 2 | ファイルが見つからない・読めない・空 |
+| 2 | ファイルが見つからない、読めない、空 |
 | 3 | デコード失敗 |
 | 4 | オーディオデバイスの初期化失敗 |
-| 5 | 再生失敗 |
+| 5 | 再生失敗（常駐プロセスの起動・通信の失敗を含む） |
 
-## 設定ファイル
+## 設定
 
-実行ファイルと同じディレクトリに `minply.toml` を置くことで動作を調整できる。設定ファイルがない場合はデフォルト値で動作する。
+実行ファイルと同じフォルダに `minply.toml` を置くと動作を調整できます。無い場合は既定値で動きます。`minply.local.toml` を併せて置くと、後から読み込まれて設定を上書きします。個人環境だけの設定に使ってください。
 
-`minply.local.toml` を用意すると `minply.toml` の後に読み込まれ、設定を上書きできる（個人環境専用の設定に使用する）。
+各項目の意味と既定値は `minply.toml` のコメントに書いてあります。主な項目は次のとおりです。
 
-```toml
-[guard]
-# ガードトーンの有効/無効（デフォルト: true）
-enabled = true
-# リードイン秒数（デフォルト: 1.2、許容範囲: 0.0〜10.0）
-lead_in_duration = 1.2
-# リードアウト秒数（デフォルト: 1.2、許容範囲: 0.0〜10.0）
-lead_out_duration = 1.2
+| セクション | 項目 | 内容 |
+| --- | --- | --- |
+| `guard` | `enabled` | 不可聴音による先頭欠損の防止を使うか |
+| `guard` | `lead_in_duration` | 本編の前に流す秒数 |
+| `guard` | `lead_out_duration` | 本編の後に流す秒数 |
+| `loudness` | `enabled` | 音源ごとの音量差をそろえるか |
+| `loudness` | `target` | そろえる先の音量 |
+| `linger` | `duration` | `--session` 指定時に常駐し続ける秒数 |
 
-[loudness]
-# ラウドネスノーマライズの有効/無効（デフォルト: true）
-enabled = true
-# 目標ラウドネス LUFS（デフォルト: -16.0、許容範囲: -70.0〜0.0）
-target = -16.0
-# トゥルーピーク上限（デフォルト: 0.891 = -1dBFS、許容範囲: 0.001〜1.0）
-peak_ceiling = 0.891
+許容範囲外の値や不正な値は、警告を標準エラー出力へ出したうえで既定値に戻します。
 
-[linger]
-# --session 指定時の常駐秒数（デフォルト: 30.0、許容範囲: 1.0〜600.0）
-duration = 30.0
-```
+## 制限事項
 
-許容範囲外、非有限値、その他の不正値は警告を stderr へ出した上でデフォルト値にフォールバックする。
-`minply.toml` が 1MB を超える場合は警告を出して読み込みをスキップする。
+- 出力先は Windows の既定のオーディオデバイスに固定で、再生先は選べない
+- Opus はモノラルとステレオのみ対応する（channel mapping family 0）
+- `--session` の常駐中は設定ファイルを読み直さない（変更は常駐の終了後の再生から有効）
+- オーディオデバイスを切り替えると常駐プロセスは終了し、次の呼び出しで新しいデバイス向けに起動し直す
 
-## 技術仕様
+## ビルド
 
-- 言語：C++17（MSVC）
-- 依存ライブラリ（静的リンク、vcpkg 管理）
-  - [libopus](https://opus-codec.org/)：Opus コーデック
-  - [libogg](https://xiph.org/ogg/)：Ogg コンテナ
-  - [libebur128](https://github.com/jiixyj/libebur128)：EBU R128 ラウドネス測定
-- Windows API：Windows Media Foundation（デコード）、WASAPI（オーディオ出力）
-
-## ビルド方法
-
-vcpkg の依存ライブラリは `task build` 実行時に自動インストールされる。
+vcpkg の依存ライブラリは `task build` の実行時に自動でインストールされます。
 
 ```powershell
-# 通常ビルド（依存ライブラリの自動インストール含む）
+# 通常ビルド（依存ライブラリの自動インストールを含む）
 task build
 
-# PowerShell で直接ビルドする場合（事前に vcpkg install が必要）
+# PowerShell から直接ビルドする場合（事前に vcpkg install が必要）
 pwsh -ExecutionPolicy Bypass -File build.ps1
 ```
 
+言語は C++17（MSVC）です。デコードに Windows Media Foundation、音声出力に WASAPI を使います。以下のライブラリを静的リンクしています。
+
+- [libopus](https://opus-codec.org/)：Opus コーデック
+- [libogg](https://xiph.org/ogg/)：Ogg コンテナ
+- [libebur128](https://github.com/jiixyj/libebur128)：EBU R128 ラウドネス測定
