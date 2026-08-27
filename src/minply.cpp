@@ -291,9 +291,11 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
     if (!dataFound || dataSize == 0) return false;
     if (dataSize > size - pos) return false;
 
-    // Decide acceptance before allocating: a bit depth this decoder cannot
-    // convert must leave audioData untouched, otherwise the zero-filled buffer
-    // survives into the Media Foundation fallback as leading silence.
+    // Decide acceptance before allocating so an unconvertible bit depth fails
+    // out without sizing and filling a buffer that is about to be discarded.
+    // Leaving audioData untouched on failure is defense in depth only: the
+    // caller (DecodeInput) clears the buffer before the Media Foundation
+    // fallback, so a stale partial result cannot reach playback either way.
     bool bitDepthSupported =
         (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32)
         || (actualFormatTag == WAVE_FORMAT_PCM
@@ -631,7 +633,10 @@ static bool DecodeInput(const BYTE* data, size_t size, const WAVEFORMATEX* mixFo
     }
     if (!decoded) {
         // A failed decoder may have left partial output behind; start the
-        // fallback from an empty buffer so no silence is prepended to the audio
+        // fallback from an empty buffer so no silence is prepended to the audio.
+        // This is the single guarantee playback relies on. TryReadWavBuffer also
+        // avoids allocating on failure, but that is an allocation-saving measure,
+        // not a second correctness requirement.
         decodedData.clear();
         decoded = DecodeAudioBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
     }
