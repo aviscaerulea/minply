@@ -18,6 +18,7 @@
  *   - Windows Media Foundation: Audio decoder
  *   - libopus: Opus audio codec decoder
  *   - libogg: Ogg container format parser
+ *   - libebur128: EBU R128 loudness measurement
  *   - WASAPI: Windows audio output
  *
  * Build:
@@ -53,7 +54,7 @@
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "shlwapi.lib")
-// Note: opus.lib and ogg.lib are linked via build.ps1
+// Note: opus.lib, ogg.lib and ebur128.lib are linked via build.ps1
 
 // Error codes
 #define EXIT_SUCCESS          0
