@@ -19,6 +19,7 @@ tasks:
     desc: vcpkg で依存ライブラリをインストール
     status:
       - vcpkg list | grep -q "opus:x64-windows-static"
+      - vcpkg list | grep -q "libogg:x64-windows-static"
       - vcpkg list | grep -q "libebur128:x64-windows-static"
     cmds:
       - vcpkg install opus:x64-windows-static libogg:x64-windows-static libebur128:x64-windows-static
