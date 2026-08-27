@@ -997,6 +997,17 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     if (!ok) return false;
     content.resize(bytesRead);
 
+    // Windows editors add a UTF-8 BOM readily (PowerShell 5.1 Set-Content
+    // -Encoding UTF8, VS Code utf8bom, old Notepad). Leaving it makes a
+    // first-line section header unrecognized, and every key under that section
+    // is then dropped without a warning.
+    if (content.size() >= 3
+        && static_cast<unsigned char>(content[0]) == 0xEF
+        && static_cast<unsigned char>(content[1]) == 0xBB
+        && static_cast<unsigned char>(content[2]) == 0xBF) {
+        content.erase(0, 3);
+    }
+
     std::string section;
     size_t lineStart = 0;
     int lineNum = 0;
