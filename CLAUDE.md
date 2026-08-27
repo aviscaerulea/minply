@@ -19,12 +19,12 @@
 ### ビルド環境
 
 - PowerShell は pwsh.exe（PowerShell 7+）を使用
-- Visual Studio ツール群は `Enable-VSDev` で有効化
+- Visual Studio 開発環境は build.ps1 が `Enter-VsDevShell` で自動ロードするため、事前の有効化は不要
 - Task による自動ビルドスクリプトを優先使用
 
 ### ビルド＆テスト手順
 
-- ビルド: `Enable-VSDev` → `task build`
+- ビルド: `task build`
 - テスト: `.\test.bat`（PowerShell から実行）
 
 ### リリース手順
