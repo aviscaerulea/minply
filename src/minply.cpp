@@ -303,11 +303,15 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
 
     UINT32 bytesPerSample = fmt.Format.wBitsPerSample / 8;
     UINT32 totalSamples = dataSize / bytesPerSample;
-    // A data chunk length that is not a whole number of samples is malformed:
-    // the float32 path memcpy's dataSize bytes into a buffer sized by sample
-    // count, and a sub-sample length would return success with no audio at all.
-    // Reject here and let the Media Foundation fallback handle the file.
-    if ((dataSize % bytesPerSample) != 0 || totalSamples == 0) return false;
+    // Two independent malformed-length cases, both rejected here so the Media
+    // Foundation fallback handles the file:
+    //   - a length that is not a whole number of samples: the float32 path
+    //     memcpy's dataSize bytes into a buffer sized by sample count, so it
+    //     would write up to bytesPerSample - 1 bytes past the allocation
+    //   - a length shorter than one frame: playback divides the sample count by
+    //     the channel count, yielding zero frames, so it would report success
+    //     with no audio at all
+    if ((dataSize % bytesPerSample) != 0 || totalSamples < fmt.Format.nChannels) return false;
     audioData.resize(totalSamples);
 
     const BYTE* rawData = data + pos;
