@@ -372,7 +372,12 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
 
     for (size_t i = 0; i < dstFrames; i++) {
         float srcIndex = static_cast<float>(i * srcRate) / dstRate;
-        size_t idx0 = static_cast<size_t>(srcIndex);
+        // The float division rounds twice, so srcIndex can land one frame past
+        // the true value on long inputs. Equal-rate paths have zero headroom
+        // (dstFrames == srcFrames), so clamp like idx1 to stay in bounds.
+        // frac may reach 1.0, but then idx1 == idx0 makes s1 == s0 and the
+        // interpolated value stays the last sample.
+        size_t idx0 = (std::min)(static_cast<size_t>(srcIndex), srcFrames - 1);
         size_t idx1 = (std::min)(idx0 + 1, srcFrames - 1);
         float frac = srcIndex - idx0;
 
