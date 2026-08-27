@@ -72,7 +72,7 @@ constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
 constexpr float TWO_PI = 6.2831853f;        // 2π
 
 constexpr float LOUDNESS_TARGET = -16.0f;        // Target integrated loudness in LUFS (optimized for notification sounds)
-constexpr float LOUDNESS_PEAK_CEILING = 0.891f;  // True peak ceiling (-1dBFS); prevents clipping after loudness gain
+constexpr float LOUDNESS_PEAK_CEILING = 0.891f;  // Sample peak ceiling (-1dBFS); prevents clipping after loudness gain
 constexpr float LOUDNESS_MIN_PEAK = 1e-6f;       // Minimum peak threshold; skip normalization for near-silence
 
 constexpr float FADE_DURATION = 0.005f;    // Fade in/out duration in seconds (click noise reduction)
@@ -696,7 +696,7 @@ std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float du
 // Normalize audio using EBU R128 integrated loudness (ITU-R BS.1770-4)
 //
 // Measures integrated loudness via libebur128, computes gain to reach target,
-// then clamps gain if true peak would exceed peakCeiling.
+// then clamps gain if sample peak would exceed peakCeiling.
 void NormalizeLoudness(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels,
                        float target, float peakCeiling) {
     if (audioData.empty()) return;
