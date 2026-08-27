@@ -122,7 +122,7 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Output is fixed to the Windows default audio device. The playback device cannot be selected
 - Opus support is limited to mono and stereo (channel mapping family 0)
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
-- Switching the audio device terminates the resident process. The next invocation starts a new one for the new device
+- Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 
 ## Build
 
