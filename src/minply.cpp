@@ -972,7 +972,9 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
 // Parse a subset of TOML (sections + bool/float key-value) into config.
 //
 // Unknown sections and keys are silently ignored.
-// Returns false only if the file cannot be opened; parse warnings go to stderr.
+// Returns false when the file cannot be opened, its size cannot be obtained,
+// it exceeds the 1MB cap, or the read fails. The size-cap case also warns to
+// stderr, as do parse warnings.
 static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
