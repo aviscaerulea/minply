@@ -21,7 +21,8 @@
  *   - WASAPI: Windows audio output
  *
  * Build:
- *   Visual Studio 2019 or later, Release configuration, x64
+ *   task build (vcpkg installs the x64-windows-static dependencies, then
+ *   build.ps1 invokes cl.exe directly; C++17 / MSVC / x64)
  */
 
 #include <windows.h>
