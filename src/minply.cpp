@@ -310,9 +310,13 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
     //   - a length that is not a whole number of samples: the float32 path
     //     memcpy's dataSize bytes into a buffer sized by sample count, so it
     //     would write up to bytesPerSample - 1 bytes past the allocation
-    //   - a length shorter than one frame: playback divides the sample count by
-    //     the channel count, yielding zero frames, so it would report success
-    //     with no audio at all
+    //   - a length shorter than one frame: dividing the sample count by the
+    //     file's own channel count yields zero frames, so this would report
+    //     success with no audio at all. Both downstream paths divide by that
+    //     same count: ConvertFormat returns an empty vector when a channel
+    //     conversion is needed, and playback finds zero frames when it is not.
+    //     The threshold must stay fmt.Format.nChannels for that reason -
+    //     using targetChannels would let a sub-frame multichannel file through
     if ((dataSize % bytesPerSample) != 0 || totalSamples < fmt.Format.nChannels) return false;
     audioData.resize(totalSamples);
 
