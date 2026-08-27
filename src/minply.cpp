@@ -1609,32 +1609,47 @@ static int RunServer(const wchar_t* sessionId) {
                 size_t frames = decoded.size() / mixFormat->nChannels;
                 DWORD audioMs = static_cast<DWORD>(frames * 1000ULL / mixFormat->nSamplesPerSec);
 
+                // The render thread's exit cleanup signals doneEvent only once,
+                // so a request queued after it would never be signalled and
+                // would burn the whole play margin before failing. Test
+                // deviceLost inside the same critical section: in the reverse
+                // order the cleanup still sees hasPending and signals.
+                bool renderDead = false;
                 EnterCriticalSection(&state.cs);
-                state.pending = std::move(decoded);
-                state.hasPending = true;
+                renderDead = state.deviceLost;
+                if (!renderDead) {
+                    state.pending = std::move(decoded);
+                    state.hasPending = true;
+                }
                 LeaveCriticalSection(&state.cs);
 
-                DWORD w = WaitForSingleObject(state.doneEvent, audioMs + SERVER_PLAY_MARGIN_MS);
-                if (w != WAIT_OBJECT_0) {
-                    // A timeout leaves the render thread in an unknown state (a late
-                    // doneEvent would corrupt the next request), so stop serving
+                if (renderDead) {
                     response.exitCode = ERR_PLAYBACK_FAILED;
                     renderWedged = true;
                 }
                 else {
-                    // The render thread reports the outcome; losing the device
-                    // afterwards ends the linger but does not undo a finished playback
-                    response.exitCode = state.playResult;
-                    if (state.deviceLost) renderWedged = true;
+                    DWORD w = WaitForSingleObject(state.doneEvent, audioMs + SERVER_PLAY_MARGIN_MS);
+                    if (w != WAIT_OBJECT_0) {
+                        // A timeout leaves the render thread in an unknown state (a late
+                        // doneEvent would corrupt the next request), so stop serving
+                        response.exitCode = ERR_PLAYBACK_FAILED;
+                        renderWedged = true;
+                    }
+                    else {
+                        // The render thread reports the outcome; losing the device
+                        // afterwards ends the linger but does not undo a finished playback
+                        response.exitCode = state.playResult;
+                        if (state.deviceLost) renderWedged = true;
 
-                    if (response.exitCode == EXIT_SUCCESS) {
-                        // The render thread signals when the last frame is written, so the
-                        // frames still sitting in the device buffer have yet to be heard.
-                        // Hold the client until they drain, preserving the contract that
-                        // minply exits only after its audio finished.
-                        DWORD bufferMs = static_cast<DWORD>(
-                            static_cast<ULONGLONG>(state.bufferFrames) * 1000ULL / mixFormat->nSamplesPerSec);
-                        Sleep(bufferMs + DRAIN_WAIT_MS);
+                        if (response.exitCode == EXIT_SUCCESS) {
+                            // The render thread signals when the last frame is written, so the
+                            // frames still sitting in the device buffer have yet to be heard.
+                            // Hold the client until they drain, preserving the contract that
+                            // minply exits only after its audio finished.
+                            DWORD bufferMs = static_cast<DWORD>(
+                                static_cast<ULONGLONG>(state.bufferFrames) * 1000ULL / mixFormat->nSamplesPerSec);
+                            Sleep(bufferMs + DRAIN_WAIT_MS);
+                        }
                     }
                 }
             }
