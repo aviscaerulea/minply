@@ -289,6 +289,16 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
     if (!dataFound || dataSize == 0) return false;
     if (dataSize > size - pos) return false;
 
+    // Decide acceptance before allocating: a bit depth this decoder cannot
+    // convert must leave audioData untouched, otherwise the zero-filled buffer
+    // survives into the Media Foundation fallback as leading silence.
+    bool bitDepthSupported =
+        (actualFormatTag == WAVE_FORMAT_IEEE_FLOAT && fmt.Format.wBitsPerSample == 32)
+        || (actualFormatTag == WAVE_FORMAT_PCM
+            && (fmt.Format.wBitsPerSample == 16 || fmt.Format.wBitsPerSample == 24
+                || fmt.Format.wBitsPerSample == 32));
+    if (!bitDepthSupported) return false;
+
     UINT32 bytesPerSample = fmt.Format.wBitsPerSample / 8;
     UINT32 totalSamples = dataSize / bytesPerSample;
     // A data chunk length that is not a whole number of samples is malformed:
@@ -609,6 +619,9 @@ static bool DecodeInput(const BYTE* data, size_t size, const WAVEFORMATEX* mixFo
         decoded = TryDecodeOpusBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
     }
     if (!decoded) {
+        // A failed decoder may have left partial output behind; start the
+        // fallback from an empty buffer so no silence is prepended to the audio
+        decodedData.clear();
         decoded = DecodeAudioBuffer(data, size, decodedData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
     }
 
