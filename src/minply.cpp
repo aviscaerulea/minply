@@ -256,6 +256,10 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
             break;
         }
         if (!skipBytes(chunkSize)) break;
+        // RIFF alignment: odd-sized chunks are followed by one pad byte. The
+        // pad may be absent after the final chunk, so a failed skip just ends
+        // the scan instead of being treated as an error.
+        if ((chunkSize & 1) && !skipBytes(1)) break;
     }
     if (!fmtFound) return false;
 
@@ -287,6 +291,10 @@ bool TryReadWavBuffer(const BYTE* data, size_t size, std::vector<float>& audioDa
             break;
         }
         if (!skipBytes(chunkSize)) break;
+        // RIFF alignment: odd-sized chunks are followed by one pad byte. The
+        // pad may be absent after the final chunk, so a failed skip just ends
+        // the scan instead of being treated as an error.
+        if ((chunkSize & 1) && !skipBytes(1)) break;
     }
     if (!dataFound || dataSize == 0) return false;
     if (dataSize > size - pos) return false;
