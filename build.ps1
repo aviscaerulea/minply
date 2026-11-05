@@ -1,5 +1,12 @@
 # minply ビルドスクリプト
 # Visual Studio の開発環境を pwsh で有効化してコンパイルを実行
+#
+# 引数:
+#   -Version  埋め込むバージョン文字列（例：v1.9.0、1.9.0-3-gabc1234-dirty）。先頭の v は除く
+
+param(
+    [string]$Version = "0.0.0"
+)
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -36,9 +43,26 @@ Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments 
 
 New-Item -ItemType Directory -Path "out" -Force | Out-Null
 
+# バージョン定義ヘッダの生成
+# rc.exe の /d では文字列リテラルを渡せないため、ヘッダを生成して .rc から include する。
+# 数値版は先頭の major.minor.patch のみを採り、取れなければ 0,0,0,0 とする
+$Version = $Version -replace '^v', ''
+$verMatch = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')
+$verNum = if ($verMatch.Success) {
+    "$($verMatch.Groups[1].Value),$($verMatch.Groups[2].Value),$($verMatch.Groups[3].Value),0"
+}
+else {
+    "0,0,0,0"
+}
+@(
+    "#define APP_VERSION_NUM $verNum",
+    "#define APP_VERSION_STR `"$Version`""
+) | Set-Content -Path "out\version.rc.h" -Encoding ascii
+
 Write-Host "Compiling resources..." -ForegroundColor Cyan
 
-rc /nologo /fo out\minply.res src\minply.rc 2>&1 | Tee-Object -FilePath "out/build.log"
+# /c65001：.rc の日本語コメントを CP932 で走査させないため
+rc /nologo /c65001 /I out\ /fo out\minply.res src\minply.rc 2>&1 | Tee-Object -FilePath "out/build.log"
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Resource compile failed" -ForegroundColor Red
     exit 1
@@ -55,6 +79,14 @@ cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed" -ForegroundColor Red
+    exit 1
+}
+
+# バージョン情報リソースの埋め込み検証
+# 埋め込みが欠けてもビルドは通るため、ここで検出する
+$verInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo((Resolve-Path "out/minply.exe").Path)
+if ($verInfo.ProductVersion -ne $Version -or -not $verInfo.FileDescription) {
+    Write-Host "Version resource check failed: ProductVersion='$($verInfo.ProductVersion)' expected='$Version'" -ForegroundColor Red
     exit 1
 }
 

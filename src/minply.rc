@@ -1,4 +1,37 @@
 // vim: set ft=rc fenc=utf-8 ff=unix :
 // minply リソーススクリプト
+#include <winver.h>
+#include "version.rc.h"
+
 // ID 1 はエクスプローラーが参照するアプリケーションアイコンの標準 ID
 1 ICON "src/app.ico"
+
+// バージョン情報
+// FileDescription と ProductName が空だと、音量ミキサーなどの一覧 UI が表示名を exe の親フォルダ名
+// （Scoop ではバージョン番号）で代替するため、必ず埋める
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     APP_VERSION_NUM
+PRODUCTVERSION  APP_VERSION_NUM
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription",  "minply - Minimal Audio Player"
+            VALUE "FileVersion",      APP_VERSION_STR
+            VALUE "InternalName",     "minply"
+            VALUE "OriginalFilename", "minply.exe"
+            VALUE "ProductName",      "minply"
+            VALUE "ProductVersion",   APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 0x04B0
+    END
+END

@@ -23,7 +23,7 @@ jobs:
         run: vcpkg install opus:x64-windows-static libogg:x64-windows-static libebur128:x64-windows-static
 
       - name: Build
-        run: pwsh -ExecutionPolicy Bypass -File build.ps1
+        run: pwsh -ExecutionPolicy Bypass -File build.ps1 -Version "${{ github.ref_name }}"
 
       - name: Package
         run: |
