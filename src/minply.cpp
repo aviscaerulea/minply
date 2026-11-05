@@ -34,6 +34,7 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <io.h>
 #include <fcntl.h>
 #include <iostream>
@@ -54,6 +55,7 @@
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
 // Note: opus.lib, ogg.lib and ebur128.lib are linked via build.ps1
 
 // Error codes
@@ -151,9 +153,88 @@ struct AppConfig {
     float lingerDuration      = LINGER_DURATION;
 };
 
-// Print error message to stderr
+// Convert a UTF-16 string to UTF-8
+static std::string WideToUtf8(const std::wstring& s) {
+    if (s.empty()) return {};
+    int len = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return {};
+    std::string out(static_cast<size_t>(len), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &out[0], len, nullptr, nullptr);
+    return out;
+}
+
+// Resolve the log directory %LOCALAPPDATA%\minply\logs, creating it when absent
+//
+// Logs live outside the executable directory so that they survive Scoop
+// version folders being replaced on update. Returns an empty string when the
+// known folder cannot be resolved.
+static std::wstring GetLogDir() {
+    PWSTR base = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &base))) {
+        CoTaskMemFree(base);
+        return {};
+    }
+    std::wstring dir = base;
+    CoTaskMemFree(base);
+    dir += L"\\minply";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    dir += L"\\logs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+// Path of today's log file (<log dir>\YYYY-MM-DD.log); empty when the log dir is unavailable
+static std::wstring GetTodayLogPath() {
+    std::wstring dir = GetLogDir();
+    if (dir.empty()) return {};
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t name[32];
+    swprintf_s(name, L"\\%04u-%02u-%02u.log", st.wYear, st.wMonth, st.wDay);
+    return dir + name;
+}
+
+// Append one line to today's log file
+//
+// Line format: "YYYY-MM-DD HH:MM:SS [<pid>] <message>" in UTF-8 without BOM,
+// local time. Records errors and config warnings; successful playbacks are
+// deliberately not logged.
+// Every call opens, appends with a single WriteFile and closes, so concurrent
+// minply processes interleave whole lines. Failures are ignored: logging must
+// never change the playback outcome.
+static void WriteLog(const std::string& utf8Message) {
+    std::wstring path = GetTodayLogPath();
+    if (path.empty()) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u [%lu] ",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+             GetCurrentProcessId());
+    std::string line = prefix + utf8Message + "\n";
+
+    HANDLE h = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    CloseHandle(h);
+}
+
+// Print error message to stderr and the log
+//
+// The log copy matters when minply runs from a hook or as the detached linger
+// server, where nobody sees stderr.
 void PrintError(const char* message) {
     std::cerr << "Error: " << message << std::endl;
+    WriteLog(std::string("Error: ") + message);
+}
+
+// Print warning message to stderr and the log
+static void PrintWarning(const std::string& message) {
+    std::cerr << "Warning: " << message << std::endl;
+    WriteLog("Warning: " + message);
 }
 
 // Validate a session id
@@ -994,8 +1075,8 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
 //
 // Unknown sections and keys are silently ignored.
 // Returns false when the file cannot be opened, its size cannot be obtained,
-// it exceeds the 1MB cap, or the read fails. The size-cap case also warns to
-// stderr, as do parse warnings.
+// it exceeds the 1MB cap, or the read fails. The size-cap case also warns
+// (stderr and log), as do parse warnings.
 static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     HANDLE hFile = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1010,9 +1091,7 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     constexpr DWORD MAX_TOML_SIZE = 1024 * 1024;
     if (fileSize > MAX_TOML_SIZE) {
         CloseHandle(hFile);
-        char nameBuf[MAX_PATH] = {};
-        WideCharToMultiByte(CP_UTF8, 0, PathFindFileNameW(path), -1, nameBuf, sizeof(nameBuf), nullptr, nullptr);
-        std::cerr << "Warning: " << nameBuf << ": config file too large; ignored" << std::endl;
+        PrintWarning(WideToUtf8(PathFindFileNameW(path)) + ": config file too large; ignored");
         return false;
     }
     std::string content(fileSize, '\0');
@@ -1071,7 +1150,7 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         auto parseBool = [&](bool& dest) {
             if (val == "true") dest = true;
             else if (val == "false") dest = false;
-            else std::cerr << "Warning: config line " << lineNum << ": invalid bool '" << val << "'" << std::endl;
+            else PrintWarning("config line " + std::to_string(lineNum) + ": invalid bool '" + val + "'");
         };
         // Parse and range-check a float value.
         // Rejects non-finite values and values outside [minVal, maxVal]; keeps the existing default on failure.
@@ -1079,7 +1158,7 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             char* end;
             float v = strtof(val.c_str(), &end);
             if (end == val.c_str() || !std::isfinite(v) || v < minVal || v > maxVal) {
-                std::cerr << "Warning: config line " << lineNum << ": invalid value '" << val << "'" << std::endl;
+                PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
                 return;
             }
             dest = v;

@@ -100,6 +100,10 @@ An id may contain alphanumeric characters plus `.`, `_` and `-`, and must be 1 t
 | 4 | Audio device initialization failed |
 | 5 | Playback failed (including failure to start or reach the resident process) |
 
+### Log
+
+Errors and configuration file warnings are written to standard error and also appended, one line each, to `%LOCALAPPDATA%\minply\logs\YYYY-MM-DD.log`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play.
+
 ## Configuration
 
 Placing `minply.toml` in the same folder as the executable lets you adjust the behavior. Without it, minply runs with the default values. If you also place `minply.local.toml`, it is loaded afterwards and overrides the settings. Use it for settings specific to your own environment.
