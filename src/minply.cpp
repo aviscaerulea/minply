@@ -12,6 +12,11 @@
  *   - Plays inaudible 19kHz guard tone before/after audio (BLE anti-clipping)
  *   - --session <id> keeps a linger server alive so consecutive playbacks of the
  *     same session skip the lead-in entirely (uninterrupted guard tone)
+ *   - Skips playback (exit 0) while a mute condition holds: a configured
+ *     process or window title, a microphone/camera in use (tray toggle), or
+ *     the tray's manual mute
+ *   - Logs mute decisions, errors and config warnings to
+ *     %LOCALAPPDATA%\minply\logs
  *   - Exits immediately after playback completes
  *
  * Dependencies:
@@ -49,6 +54,10 @@
 #include <atomic>
 #include <utility>
 #include <new>
+#include <tlhelp32.h>
+#include <audiopolicy.h>
+#include <regex>
+#include <unordered_map>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "mfplat.lib")
@@ -56,6 +65,8 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 // Note: opus.lib, ogg.lib and ebur128.lib are linked via build.ps1
 
 // Error codes
@@ -137,10 +148,47 @@ struct PipeResponse {
 };
 #pragma pack(pop)
 
+// Mute parameters
+//
+// The manual mute lives in a named manual-reset waitable timer owned by the
+// tray process (--tray): non-signaled means muted, signaled means not muted.
+// Players only open it for SYNCHRONIZE and poll its state, so a hung or dead
+// tray can never block playback; when the tray exits the kernel destroys the
+// object and the manual mute is gone with it.
+constexpr wchar_t MANUAL_MUTE_TIMER_NAME[] = L"Local\\minply-manual-mute";
+// Registry key for settings the tray menu toggles (REG_DWORD values under HKCU)
+constexpr wchar_t REG_SETTINGS_KEY[]       = L"Software\\minply";
+// Non-zero: do not play while a microphone or camera is in use. Absent means 0
+constexpr wchar_t REG_MUTE_IN_MEETING[]    = L"MuteInMeeting";
+// Upper bound of one timed-mute menu entry (7 days); "indefinite" covers longer
+constexpr uint64_t MUTE_DURATION_MAX_SEC   = 7ULL * 24 * 3600;
+
+// One [[mute.window]] rule: mute while a visible top-level window of the
+// process (exe name, case-insensitive) has a title matching the pattern
+// (ECMAScript, case-insensitive, partial match). A rule missing either key is
+// dropped by LoadConfig.
+struct MuteWindowRule {
+    std::wstring process;
+    std::wstring titlePattern;
+    std::wregex  title;
+    bool         hasTitle = false;
+    int          line     = 0;      // Line of the [[mute.window]] header, for warnings
+};
+
+// One timed-mute entry of the tray menu
+struct MuteDuration {
+    DWORD        seconds = 0;
+    std::wstring label;             // Menu text such as "30 分間"
+};
+
+static std::vector<MuteDuration> DefaultMuteDurations();
+
 // Application configuration
 //
 // Loaded from minply.toml / minply.local.toml in the executable directory.
 // Missing file or missing key falls back to the default value.
+// muteProcesses and muteDurations are replaced as a whole by the later file
+// that sets them; muteWindows accumulates the rules of both files.
 struct AppConfig {
     bool  guardEnabled        = true;
     float guardFrequency      = BLE_GUARD_FREQ;
@@ -151,6 +199,9 @@ struct AppConfig {
     float loudnessTarget      = LOUDNESS_TARGET;
     float loudnessPeakCeiling = LOUDNESS_PEAK_CEILING;
     float lingerDuration      = LINGER_DURATION;
+    std::vector<std::wstring>   muteProcesses;
+    std::vector<MuteWindowRule> muteWindows;
+    std::vector<MuteDuration>   muteDurations = DefaultMuteDurations();
 };
 
 // Convert a UTF-16 string to UTF-8
@@ -160,6 +211,16 @@ static std::string WideToUtf8(const std::wstring& s) {
     if (len <= 0) return {};
     std::string out(static_cast<size_t>(len), '\0');
     WideCharToMultiByte(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &out[0], len, nullptr, nullptr);
+    return out;
+}
+
+// Convert a UTF-8 string to UTF-16
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return {};
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (len <= 0) return {};
+    std::wstring out(static_cast<size_t>(len), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &out[0], len);
     return out;
 }
 
@@ -197,8 +258,8 @@ static std::wstring GetTodayLogPath() {
 // Append one line to today's log file
 //
 // Line format: "YYYY-MM-DD HH:MM:SS [<pid>] <message>" in UTF-8 without BOM,
-// local time. Records errors and config warnings; successful playbacks are
-// deliberately not logged.
+// local time. Records mute decisions, errors and config warnings; successful
+// playbacks are deliberately not logged.
 // Every call opens, appends with a single WriteFile and closes, so concurrent
 // minply processes interleave whole lines. Failures are ignored: logging must
 // never change the playback outcome.
@@ -1071,9 +1132,136 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
     return success;
 }
 
-// Parse a subset of TOML (sections + bool/float key-value) into config.
+// Strip a trailing TOML comment from a line: cut at the first '#' outside a quoted string
 //
-// Unknown sections and keys are silently ignored.
+// A plain find('#') would cut regex patterns and window titles that contain '#'.
+static std::string StripTomlComment(const std::string& s) {
+    char quote = 0;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[i];
+        if (quote) {
+            if (quote == '"' && c == '\\') i++;   // Skip the escaped character
+            else if (c == quote) quote = 0;
+        }
+        else if (c == '"' || c == '\'') {
+            quote = c;
+        }
+        else if (c == '#') {
+            return s.substr(0, i);
+        }
+    }
+    return s;
+}
+
+// Parse one TOML string token starting at pos
+//
+// Accepts "basic" strings with only the \\ and \" escapes, and 'literal'
+// strings without escapes; literal strings are the convenient form for
+// regex patterns. Any other escape, or a missing closing quote, fails.
+// On success pos points just past the closing quote.
+static bool ParseTomlStringToken(const std::string& s, size_t& pos, std::string& out) {
+    if (pos >= s.size()) return false;
+    char quote = s[pos];
+    if (quote != '"' && quote != '\'') return false;
+
+    out.clear();
+    for (size_t i = pos + 1; i < s.size(); i++) {
+        char c = s[i];
+        if (c == quote) {
+            pos = i + 1;
+            return true;
+        }
+        if (quote == '"' && c == '\\') {
+            if (i + 1 >= s.size()) return false;
+            char escaped = s[++i];
+            if (escaped != '\\' && escaped != '"') return false;
+            out += escaped;
+            continue;
+        }
+        out += c;
+    }
+    return false;
+}
+
+// Parse a whole value that must be exactly one TOML string
+static bool ParseTomlString(const std::string& val, std::string& out) {
+    size_t pos = 0;
+    return ParseTomlStringToken(val, pos, out) && pos == val.size();
+}
+
+// Parse a one-line TOML string array such as ["a", 'b'] (empty [] and a trailing comma allowed)
+//
+// Multi-line arrays are not supported by the line-based parser; their first
+// line lacks the closing bracket and fails here, so the caller warns.
+static bool ParseTomlStringArray(const std::string& val, std::vector<std::string>& out) {
+    if (val.size() < 2 || val.front() != '[' || val.back() != ']') return false;
+
+    const size_t end = val.size() - 1;   // Index of the closing bracket
+    size_t pos = 1;
+    auto skipSpaces = [&]() {
+        while (pos < end && (val[pos] == ' ' || val[pos] == '\t')) pos++;
+    };
+
+    std::vector<std::string> items;
+    while (true) {
+        skipSpaces();
+        if (pos == end) break;
+        std::string item;
+        if (!ParseTomlStringToken(val, pos, item) || pos > end) return false;
+        items.push_back(item);
+        skipSpaces();
+        if (pos == end) break;
+        if (val[pos] != ',') return false;
+        pos++;
+    }
+    out = std::move(items);
+    return true;
+}
+
+// Parse one timed-mute entry such as "30m"
+//
+// Format: a positive integer followed by s (seconds), m (minutes) or h (hours),
+// totalling 1 second to MUTE_DURATION_MAX_SEC. The label keeps the digits as
+// written and translates the unit (s -> 秒間, m -> 分間, h -> 時間).
+static bool ParseMuteDuration(const std::string& s, MuteDuration& out) {
+    // At most 7 digits, so the product below cannot overflow
+    if (s.size() < 2 || s.size() > 8) return false;
+
+    const char unit = s.back();
+    uint64_t multiplier = 0;
+    const wchar_t* unitLabel = nullptr;
+    if      (unit == 's') { multiplier = 1;    unitLabel = L" 秒間"; }
+    else if (unit == 'm') { multiplier = 60;   unitLabel = L" 分間"; }
+    else if (unit == 'h') { multiplier = 3600; unitLabel = L" 時間"; }
+    else return false;
+
+    const std::string digits = s.substr(0, s.size() - 1);
+    for (char c : digits) {
+        if (c < '0' || c > '9') return false;
+    }
+    const uint64_t seconds = std::stoull(digits) * multiplier;
+    if (seconds == 0 || seconds > MUTE_DURATION_MAX_SEC) return false;
+
+    out.seconds = static_cast<DWORD>(seconds);
+    out.label = Utf8ToWide(digits) + unitLabel;
+    return true;
+}
+
+// Default timed-mute entries of the tray menu: 30m, 60m, 90m, 12h
+static std::vector<MuteDuration> DefaultMuteDurations() {
+    std::vector<MuteDuration> durations;
+    for (const char* spec : { "30m", "60m", "90m", "12h" }) {
+        MuteDuration d;
+        if (ParseMuteDuration(spec, d)) durations.push_back(d);
+    }
+    return durations;
+}
+
+// Parse a subset of TOML into config.
+//
+// Supported: [section] headers, the [[mute.window]] array-of-tables header,
+// and bool / float / string / one-line string-array values. Unknown sections
+// and keys are silently ignored.
 // Returns false when the file cannot be opened, its size cannot be obtained,
 // it exceeds the 1MB cap, or the read fails. The size-cap case also warns
 // (stderr and log), as do parse warnings.
@@ -1127,11 +1315,26 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     while (lineStart < content.size()) {
         size_t lineEnd = content.find('\n', lineStart);
         if (lineEnd == std::string::npos) lineEnd = content.size();
-        std::string line = trim(content.substr(lineStart, lineEnd - lineStart));
+        // Trailing comments are stripped from the whole line, so headers such
+        // as "[[mute.window]] # Meet" are recognized as well as values
+        std::string line = trim(StripTomlComment(content.substr(lineStart, lineEnd - lineStart)));
         lineStart = lineEnd + 1;
         lineNum++;
 
         if (line.empty() || line[0] == '#') continue;
+
+        // Array-of-tables header. Only [[mute.window]] is known; each header
+        // starts a new rule. The bracketed section name keeps a plain
+        // [mute.window] header from feeding keys into the rule list.
+        if (line.size() >= 4 && line.compare(0, 2, "[[") == 0 && line.compare(line.size() - 2, 2, "]]") == 0) {
+            std::string name = trim(line.substr(2, line.size() - 4));
+            section = "[[" + name + "]]";
+            if (name == "mute.window") {
+                config.muteWindows.emplace_back();
+                config.muteWindows.back().line = lineNum;
+            }
+            continue;
+        }
 
         if (line[0] == '[' && line.back() == ']') {
             section = trim(line.substr(1, line.size() - 2));
@@ -1144,9 +1347,9 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         std::string key = trim(line.substr(0, eq));
         std::string val = trim(line.substr(eq + 1));
 
-        size_t hash = val.find('#');
-        if (hash != std::string::npos) val = trim(val.substr(0, hash));
-
+        auto warnInvalid = [&]() {
+            PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
+        };
         auto parseBool = [&](bool& dest) {
             if (val == "true") dest = true;
             else if (val == "false") dest = false;
@@ -1179,6 +1382,63 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         else if (section == "linger") {
             if (key == "duration") parseFloat(config.lingerDuration, 1.0f, 600.0f);
         }
+        else if (section == "mute") {
+            if (key == "processes") {
+                std::vector<std::string> items;
+                if (!ParseTomlStringArray(val, items)) {
+                    warnInvalid();
+                }
+                else {
+                    config.muteProcesses.clear();
+                    for (const auto& item : items) {
+                        if (!item.empty()) config.muteProcesses.push_back(Utf8ToWide(item));
+                    }
+                }
+            }
+        }
+        else if (section == "[[mute.window]]") {
+            // The header handler guarantees at least one rule exists here
+            MuteWindowRule& rule = config.muteWindows.back();
+            std::string s;
+            if (key == "process") {
+                if (ParseTomlString(val, s) && !s.empty()) rule.process = Utf8ToWide(s);
+                else warnInvalid();
+            }
+            else if (key == "title") {
+                if (!ParseTomlString(val, s)) {
+                    warnInvalid();
+                }
+                else {
+                    // Compile once here so a bad pattern is reported with its line number
+                    try {
+                        std::wstring pattern = Utf8ToWide(s);
+                        rule.title = std::wregex(pattern, std::regex::ECMAScript | std::regex::icase);
+                        rule.titlePattern = pattern;
+                        rule.hasTitle = true;
+                    }
+                    catch (const std::regex_error&) {
+                        PrintWarning("config line " + std::to_string(lineNum) + ": invalid regex '" + s + "'");
+                    }
+                }
+            }
+        }
+        else if (section == "tray") {
+            if (key == "mute_durations") {
+                std::vector<std::string> items;
+                if (!ParseTomlStringArray(val, items)) {
+                    warnInvalid();
+                }
+                else {
+                    std::vector<MuteDuration> durations;
+                    for (const auto& item : items) {
+                        MuteDuration d;
+                        if (ParseMuteDuration(item, d)) durations.push_back(d);
+                        else PrintWarning("config line " + std::to_string(lineNum) + ": invalid mute duration '" + item + "'");
+                    }
+                    config.muteDurations = std::move(durations);
+                }
+            }
+        }
     }
     return true;
 }
@@ -1186,6 +1446,8 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
 // Load configuration from minply.toml and minply.local.toml in the executable directory.
 //
 // Missing files are silently skipped. Returns default AppConfig if both are absent.
+// [[mute.window]] rules missing process or title are dropped with a warning:
+// one key alone would either match nothing or mute far more than intended.
 static AppConfig LoadConfig() {
     AppConfig config;
 
@@ -1200,7 +1462,235 @@ static AppConfig LoadConfig() {
     ParseTomlFile((dir + L"minply.toml").c_str(), config);
     ParseTomlFile((dir + L"minply.local.toml").c_str(), config);
 
+    auto& rules = config.muteWindows;
+    for (auto it = rules.begin(); it != rules.end();) {
+        if (it->process.empty() || !it->hasTitle) {
+            PrintWarning("config line " + std::to_string(it->line)
+                         + ": [[mute.window]] needs both process and title; ignored");
+            it = rules.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
     return config;
+}
+
+// Whether the tray holds a manual mute
+//
+// See MANUAL_MUTE_TIMER_NAME: muted only while the timer exists and is
+// non-signaled. No tray, or any open failure, means not muted.
+static bool IsManualMuted() {
+    HANDLE timer = OpenWaitableTimerW(SYNCHRONIZE, FALSE, MANUAL_MUTE_TIMER_NAME);
+    if (!timer) return false;
+    bool muted = WaitForSingleObject(timer, 0) == WAIT_TIMEOUT;
+    CloseHandle(timer);
+    return muted;
+}
+
+// Whether the tray menu's "mute while a microphone or camera is in use" toggle is on
+static bool IsMeetingMuteEnabled() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, REG_SETTINGS_KEY, REG_MUTE_IN_MEETING,
+                        RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS
+        && value != 0;
+}
+
+// Whether Windows records the device as in use by some app
+//
+// deviceType: "microphone" or "webcam". The privacy feature keeps one subkey
+// per app under ConsentStore\<deviceType> (packaged apps) and under its
+// NonPackaged subkey (desktop apps); LastUsedTimeStop == 0 marks an app that
+// is using the device right now. This is the record behind the taskbar's
+// "in use" indicator, not a documented API. Ported from gcalntfy.
+static bool IsRegistryDeviceInUse(const wchar_t* deviceType) {
+    std::wstring basePath = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion"
+                            L"\\CapabilityAccessManager\\ConsentStore\\";
+    basePath += deviceType;
+
+    auto checkSubKeys = [](const std::wstring& keyPath, bool skipNonPackaged) -> bool {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, keyPath.c_str(), 0, KEY_READ, &key) != ERROR_SUCCESS)
+            return false;
+
+        bool inUse = false;
+        wchar_t subName[256];
+        for (DWORD idx = 0; !inUse; idx++) {
+            DWORD subNameSize = _countof(subName);
+            if (RegEnumKeyExW(key, idx, subName, &subNameSize, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS)
+                break;
+            if (skipNonPackaged && wcscmp(subName, L"NonPackaged") == 0) continue;
+
+            DWORD64 lastUsedTimeStop = 0;
+            DWORD dataSize = sizeof(lastUsedTimeStop);
+            if (RegGetValueW(key, subName, L"LastUsedTimeStop", RRF_RT_REG_QWORD,
+                             nullptr, &lastUsedTimeStop, &dataSize) == ERROR_SUCCESS
+                && lastUsedTimeStop == 0) {
+                inUse = true;
+            }
+        }
+        RegCloseKey(key);
+        return inUse;
+    };
+
+    if (checkSubKeys(basePath, true)) return true;                   // Packaged apps
+    return checkSubKeys(basePath + L"\\NonPackaged", false);         // Desktop apps
+}
+
+// Whether any non-system-sounds capture session on an active recording device is active
+//
+// Catches microphone use the privacy record misses, such as through a virtual
+// audio device. Requires COM to be initialized on the calling thread. Ported
+// from gcalntfy.
+static bool IsMicCaptureActive() {
+    bool active = false;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDeviceCollection* collection = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)&enumerator))
+        && SUCCEEDED(enumerator->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection))) {
+        UINT deviceCount = 0;
+        collection->GetCount(&deviceCount);
+
+        for (UINT i = 0; i < deviceCount && !active; i++) {
+            IMMDevice* device = nullptr;
+            IAudioSessionManager2* manager = nullptr;
+            IAudioSessionEnumerator* sessions = nullptr;
+
+            if (SUCCEEDED(collection->Item(i, &device))
+                && SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                              nullptr, (void**)&manager))
+                && SUCCEEDED(manager->GetSessionEnumerator(&sessions))) {
+                int sessionCount = 0;
+                sessions->GetCount(&sessionCount);
+
+                for (int s = 0; s < sessionCount && !active; s++) {
+                    IAudioSessionControl* control = nullptr;
+                    if (FAILED(sessions->GetSession(s, &control))) continue;
+
+                    // The system sounds session is always present and says nothing about meetings
+                    bool systemSounds = false;
+                    IAudioSessionControl2* control2 = nullptr;
+                    if (SUCCEEDED(control->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&control2))) {
+                        systemSounds = control2->IsSystemSoundsSession() == S_OK;
+                        control2->Release();
+                    }
+
+                    AudioSessionState state;
+                    if (!systemSounds && SUCCEEDED(control->GetState(&state)) && state == AudioSessionStateActive)
+                        active = true;
+                    control->Release();
+                }
+            }
+
+            if (sessions) sessions->Release();
+            if (manager) manager->Release();
+            if (device) device->Release();
+        }
+    }
+
+    if (collection) collection->Release();
+    if (enumerator) enumerator->Release();
+    return active;
+}
+
+// Whether a microphone or camera is in use (taken as "in a meeting")
+//
+// Registry records first (microphone, then camera), then the WASAPI capture
+// sessions for the microphone only. Initializes COM itself because the mute
+// check runs before playback sets COM up.
+static bool IsMeetingActive() {
+    if (IsRegistryDeviceInUse(L"microphone")) return true;
+    if (IsRegistryDeviceInUse(L"webcam")) return true;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    bool active = IsMicCaptureActive();
+    if (SUCCEEDED(hr)) CoUninitialize();
+    return active;
+}
+
+// Visible top-level window of another process, collected for title matching
+struct WindowTitle {
+    DWORD        pid;
+    std::wstring title;
+};
+
+// EnumWindows callback: collect visible windows that have a non-empty title
+//
+// GetWindowTextW does not send WM_GETTEXT to windows of other processes; it
+// reads the cached caption, so a hung application cannot stall the player.
+static BOOL CALLBACK CollectWindowTitle(HWND hwnd, LPARAM param) {
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    wchar_t buf[512];
+    int len = GetWindowTextW(hwnd, buf, _countof(buf));
+    if (len <= 0) return TRUE;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    reinterpret_cast<std::vector<WindowTitle>*>(param)->push_back({ pid, std::wstring(buf, len) });
+    return TRUE;
+}
+
+// Find a [mute] processes or [[mute.window]] match; returns the reason or an empty string
+//
+// One process snapshot serves both checks. Process names compare
+// case-insensitively against the exe file name. Window titles are matched
+// with regex_search, and a regex_error at match time (e.g. complexity limits)
+// counts as no match rather than aborting playback.
+static std::string FindProcessMuteReason(const AppConfig& config) {
+    if (config.muteProcesses.empty() && config.muteWindows.empty()) return {};
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return {};
+
+    std::unordered_map<DWORD, std::wstring> exeByPid;
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+        exeByPid[entry.th32ProcessID] = entry.szExeFile;
+    }
+    CloseHandle(snapshot);
+
+    for (const auto& name : config.muteProcesses) {
+        for (const auto& p : exeByPid) {
+            if (_wcsicmp(p.second.c_str(), name.c_str()) == 0) return "process " + WideToUtf8(p.second);
+        }
+    }
+
+    if (config.muteWindows.empty()) return {};
+
+    std::vector<WindowTitle> windows;
+    EnumWindows(CollectWindowTitle, reinterpret_cast<LPARAM>(&windows));
+
+    for (const auto& rule : config.muteWindows) {
+        for (const auto& w : windows) {
+            auto exe = exeByPid.find(w.pid);
+            if (exe == exeByPid.end() || _wcsicmp(exe->second.c_str(), rule.process.c_str()) != 0) continue;
+            bool matched = false;
+            try {
+                matched = std::regex_search(w.title, rule.title);
+            }
+            catch (const std::regex_error&) {
+                matched = false;
+            }
+            if (matched) return "window " + WideToUtf8(rule.process) + " /" + WideToUtf8(rule.titlePattern) + "/";
+        }
+    }
+    return {};
+}
+
+// Decide whether this playback must be skipped; returns the reason or an empty string
+//
+// Cheapest checks first: the tray's manual mute, then microphone/camera use
+// (only when the tray toggle is on), then process and window rules from the
+// config. The caller exits with EXIT_SUCCESS when a reason is returned.
+static std::string FindMuteReason(const AppConfig& config) {
+    if (IsManualMuted()) return "manual mute";
+    if (IsMeetingMuteEnabled() && IsMeetingActive()) return "microphone or camera in use";
+    return FindProcessMuteReason(config);
 }
 
 // Read exactly size bytes from an overlapped pipe handle
@@ -1966,6 +2456,24 @@ int wmain(int argc, wchar_t* argv[]) {
         return ERR_INVALID_ARGS;
     }
 
+    AppConfig config = LoadConfig();
+
+    // Mute check comes before reading the input so a muted call returns at
+    // once; as a consequence a muted call exits 0 even for a missing file.
+    // Piped input is still drained to the end: exiting with unread data would
+    // break the writer's pipe, and a hook piping audio in would then see its
+    // writer fail only while muted.
+    std::string muteReason = FindMuteReason(config);
+    if (!muteReason.empty()) {
+        bool fromStdin = !pathArg || wcscmp(pathArg, L"-") == 0;
+        if (fromStdin) {
+            std::vector<BYTE> discarded;
+            ReadAllStdin(discarded);
+        }
+        WriteLog("muted (" + muteReason + "): " + (fromStdin ? std::string("stdin") : WideToUtf8(pathArg)));
+        return EXIT_SUCCESS;
+    }
+
     // Load audio data into buffer
     //
     // Argument resolution:
@@ -2025,13 +2533,12 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // Session mode delegates playback to the linger server, which loads its own
-    // configuration; reading it here as well would only duplicate any warnings
+    // Session mode delegates playback to the linger server. The client has read
+    // the configuration only for the mute check; the server reads it again for
+    // playback, so warnings can appear twice in the log when a server starts
     if (sessionId) {
         return RunClient(sessionId, inputData);
     }
-
-    AppConfig config = LoadConfig();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {

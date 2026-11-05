@@ -8,7 +8,7 @@
 
 An ultra-lightweight CLI audio player for Windows, made for notification sounds and text-to-speech output.
 
-Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 570KB and needs no additional runtime.
+Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 690KB and needs no additional runtime.
 
 ## Features
 
@@ -18,6 +18,7 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 - Standard input playback: audio data can be piped in instead of passing a file path
 - Single executable: no installation required, just drop it in place
 - Immediate exit: plays without showing a window and exits as soon as it finishes
+- Mute conditions: stays silent while specified apps are running or while a specific site is open in the browser
 
 ## Installation
 
@@ -118,8 +119,10 @@ The meaning and default value of each item are documented in the comments inside
 | `loudness` | `enabled` | Whether to even out volume differences between sources |
 | `loudness` | `target` | The loudness to normalize to |
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
+| `mute` | `processes` | Apps (exe names) that suppress playback while running |
+| `mute.window` | `process`, `title` | Suppress playback when a window title of the app matches the regular expression |
 
-Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error.
+Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log.
 
 ## Limitations
 
@@ -127,6 +130,8 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Opus support is limited to mono and stereo (channel mapping family 0)
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
+- A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
+- When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
 
 ## Build
 
