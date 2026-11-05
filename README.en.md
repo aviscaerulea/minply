@@ -18,7 +18,8 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 - Standard input playback: audio data can be piped in instead of passing a file path
 - Single executable: no installation required, just drop it in place
 - Immediate exit: plays without showing a window and exits as soon as it finishes
-- Mute conditions: stays silent while specified apps are running or while a specific site is open in the browser
+- Mute conditions: stays silent while specified apps are running, while a specific site is open in the browser, or while a microphone or camera is in use
+- Manual mute: silences playback from the notification area menu, for a set time or with no time limit
 
 ## Installation
 
@@ -42,10 +43,20 @@ scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install minply
 ```
 
+#### Cleaning up after uninstalling
+
+The notification area settings stay in the Windows registry, and the logs stay in `%LOCALAPPDATA%\minply`. To remove everything, first turn off "スタートアップ登録" (startup registration) in the tray menu. Then run the following commands.
+
+```powershell
+Remove-Item -Recurse HKCU:\Software\minply
+Remove-Item -Recurse $env:LOCALAPPDATA\minply
+```
+
 ## Usage
 
 ```
 minply.exe [--session <id>] [audio file | -]
+minply.exe --tray
 ```
 
 ```powershell
@@ -90,6 +101,19 @@ Playback requests sharing an id are handled one at a time in order, while differ
 
 An id may contain alphanumeric characters plus `.`, `_` and `-`, and must be 1 to 64 characters long.
 
+### Notification area
+
+Starting `minply.exe --tray` keeps minply resident in the notification area. The icon's right-click menu (in Japanese) offers the following.
+
+| Operation | Description |
+| --- | --- |
+| Manual mute | Silences playback with no time limit, or for a configured time (30 minutes, 60 minutes, 90 minutes, or 12 hours by default). The icon shows a red slash while muted |
+| Mute while a microphone or camera is in use | Silences playback while a microphone or camera is in use, such as during a meeting (off by default) |
+| Startup registration | Starts the tray automatically at sign-in |
+| Open the configuration file, open the log file | Opens each file in its default app |
+
+The manual mute is released when the tray exits. The microphone/camera setting and the startup registration persist across tray restarts.
+
 ### Exit codes
 
 | Code | Description |
@@ -121,6 +145,7 @@ The meaning and default value of each item are documented in the comments inside
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
 | `mute` | `processes` | Apps (exe names) that suppress playback while running |
 | `mute.window` | `process`, `title` | Suppress playback when a window title of the app matches the regular expression |
+| `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
 
 Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log.
 
@@ -131,6 +156,8 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
+- The tray setting (`mute_durations`) is read only when the tray starts
+- Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
 - When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
 
 ## Build

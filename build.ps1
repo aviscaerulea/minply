@@ -44,7 +44,7 @@ Enter-VsDevShell -VsInstallPath $vsPath -SkipAutomaticLocation -DevCmdArguments 
 New-Item -ItemType Directory -Path "out" -Force | Out-Null
 
 # バージョン定義ヘッダの生成
-# rc.exe の /d では文字列リテラルを渡せないため、ヘッダを生成して .rc から include する。
+# rc.exe の /d では文字列リテラルを渡せないため、ヘッダを生成して .rc と .cpp から include する。
 # 数値版は先頭の major.minor.patch のみを採り、取れなければ 0,0,0,0 とする
 $Version = $Version -replace '^v', ''
 $verMatch = [regex]::Match($Version, '^(\d+)\.(\d+)\.(\d+)')
@@ -58,6 +58,7 @@ else {
     "#define APP_VERSION_NUM $verNum",
     "#define APP_VERSION_STR `"$Version`""
 ) | Set-Content -Path "out\version.rc.h" -Encoding ascii
+"#define APP_VERSION L`"$Version`"" | Set-Content -Path "out\version.h" -Encoding ascii
 
 Write-Host "Compiling resources..." -ForegroundColor Cyan
 
@@ -71,7 +72,7 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "Compiling src\minply.cpp..." -ForegroundColor Cyan
 
 cl /nologo /EHsc /O2 /MT /std:c++17 /W3 /utf-8 `
-   /I"$vcpkgInclude" `
+   /I"$vcpkgInclude" /I out\ `
    /Fo:out/ /Fe:out/minply.exe src\minply.cpp out\minply.res `
    ole32.lib mfplat.lib mfreadwrite.lib mfuuid.lib `
    "$vcpkgLib\opus.lib" "$vcpkgLib\ogg.lib" "$vcpkgLib\ebur128.lib" `
