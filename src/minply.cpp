@@ -2036,7 +2036,8 @@ static DWORD WINAPI RenderThreadProc(LPVOID param) {
 // FILE_FLAG_FIRST_PIPE_INSTANCE doubles as the single-server election: a second
 // server for the same id fails here and exits quietly.
 // Startup failures go through PrintError: the detached server has no visible
-// stderr, and the client only observes a pipe that never appears.
+// stderr, and the client only observes the pipe failing to appear or dropping
+// without a response, never the cause.
 static int RunServer(const wchar_t* sessionId) {
     AppConfig config = LoadConfig();
 
