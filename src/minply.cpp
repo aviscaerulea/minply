@@ -1898,7 +1898,10 @@ static DWORD WINAPI RenderThreadProc(LPVOID param) {
     const UINT32 rate     = state->mixFormat->nSamplesPerSec;
     const bool   guardOn  = state->config.guardEnabled;
     const float  amp      = state->config.guardAmplitude;
-    const float  phaseInc = TWO_PI * state->config.guardFrequency / rate;
+    // Reduced into [0, 2π) so the single subtraction in the render loop always
+    // wraps phase back below 2π, even when the frequency is at or above the
+    // sample rate (a tone that aliases anyway, but must stay a tone, not drift)
+    const float  phaseInc = fmodf(TWO_PI * state->config.guardFrequency / rate, TWO_PI);
 
     std::vector<float> active;
     size_t activeFrames = 0;
@@ -1981,7 +1984,7 @@ static DWORD WINAPI RenderThreadProc(LPVOID param) {
                     out[f * channels + ch] = s;
                 }
                 phase += phaseInc;
-                if (phase >= TWO_PI) phase -= TWO_PI;
+                if (phase >= TWO_PI) phase -= TWO_PI;   // phaseInc < 2π, so one subtraction suffices
                 if (leadInRemain > 0) leadInRemain--;
             }
         }
