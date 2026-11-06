@@ -18,7 +18,7 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 - Standard input playback: audio data can be piped in instead of passing a file path
 - Single executable: no installation required, just drop it in place
 - Immediate exit: plays without showing a window and exits as soon as it finishes
-- Mute conditions: stays silent while specified apps are running, while a specific site is open in the browser, or while a microphone or camera is in use
+- Mute conditions: detects a specified app running, a specific site open in the browser, or a microphone or camera in use, and skips playback
 - Manual mute: silences playback from the notification area menu, for a set time or with no time limit
 
 ## Installation
@@ -43,7 +43,7 @@ scoop bucket add aviscaerulea https://github.com/aviscaerulea/scoop-bucket
 scoop install minply
 ```
 
-#### Cleaning up after uninstalling
+#### Uninstalling
 
 The notification area settings stay in the Windows registry, and the logs stay in `%LOCALAPPDATA%\minply`. To remove everything, first turn off "スタートアップ登録" (startup registration) in the tray menu. Then run the following commands.
 
