@@ -3026,7 +3026,17 @@ int wmain(int argc, wchar_t* argv[]) {
             PrintError("File too large");
             return ERR_DECODE_FAILED;
         }
-        inputData.resize(static_cast<size_t>(fileSize.QuadPart));
+        // The size passed the MAXDWORD check above but may still exceed available
+        // memory; report it like the oversized case instead of dying on an
+        // uncaught exception
+        try {
+            inputData.resize(static_cast<size_t>(fileSize.QuadPart));
+        }
+        catch (const std::bad_alloc&) {
+            CloseHandle(hFile);
+            PrintError("File too large");
+            return ERR_DECODE_FAILED;
+        }
         DWORD toRead = static_cast<DWORD>(fileSize.QuadPart);
         DWORD bytesRead = 0;
         bool readOk = ReadFile(hFile, inputData.data(), toRead, &bytesRead, nullptr);
@@ -3075,7 +3085,18 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     else {
         std::vector<float> decodedData;
-        bool decoded = DecodeInput(inputData.data(), inputData.size(), mixFormat, decodedData);
+        bool decoded = false;
+        // Same guard as the linger server: decoding expands compressed audio by
+        // a large factor, so a readable file can still exhaust memory. Report it
+        // as a decode failure (exit code 3) instead of an uncaught exception
+        try {
+            decoded = DecodeInput(inputData.data(), inputData.size(), mixFormat, decodedData);
+            if (decoded) PostProcess(decodedData, mixFormat, config);
+        }
+        catch (const std::bad_alloc&) {
+            decoded = false;
+            decodedData.clear();
+        }
 
         MFShutdown();
 
@@ -3084,8 +3105,6 @@ int wmain(int argc, wchar_t* argv[]) {
             exitCode = ERR_DECODE_FAILED;
         }
         else {
-            PostProcess(decodedData, mixFormat, config);
-
             std::vector<float> leadIn, leadOut;
             if (config.guardEnabled) {
                 leadIn = GenerateBleGuard(mixFormat->nSamplesPerSec, mixFormat->nChannels,
