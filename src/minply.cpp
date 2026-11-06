@@ -1374,11 +1374,13 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             else PrintWarning("config line " + std::to_string(lineNum) + ": invalid bool '" + val + "'");
         };
         // Parse and range-check a float value.
-        // Rejects non-finite values and values outside [minVal, maxVal]; keeps the existing default on failure.
+        // Rejects values with trailing characters (e.g. '30abc', '-16..0'), non-finite values and
+        // values outside [minVal, maxVal]; keeps the existing default on failure. The value arrives
+        // with its trailing comment and whitespace already stripped, so a valid '30.0  # note' passes.
         auto parseFloat = [&](float& dest, float minVal, float maxVal) {
             char* end;
             float v = strtof(val.c_str(), &end);
-            if (end == val.c_str() || !std::isfinite(v) || v < minVal || v > maxVal) {
+            if (end == val.c_str() || *end != '\0' || !std::isfinite(v) || v < minVal || v > maxVal) {
                 PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
                 return;
             }
