@@ -44,7 +44,7 @@ tasks:
     deps: [clean]
     cmds:
       - task: build
-      - pwsh -Command "Compress-Archive -Path {{.OUT_DIR}}/minply.exe, minply.toml -DestinationPath minply-{{.VERSION}}-x64.zip -Force"
+      - pwsh -Command "Compress-Archive -Path {{.OUT_DIR}}/minply.exe, minply.toml -DestinationPath minply-{{trimPrefix "v" .VERSION}}-x64.zip -Force"
 
   run:
     desc: test.mp3 を再生
