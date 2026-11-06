@@ -35,8 +35,10 @@ function Invoke-Minply {
     }
 }
 
+# out\minply.exe のプロセスだけを対象にする
+# プロセス名で選ぶと、別の場所に常駐しているユーザ自身のトレイまで巻き込む
 function Get-ServerPids {
-    return @(Get-Process minply -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    return @(Get-Process minply -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Select-Object -ExpandProperty Id)
 }
 
 # 1kHz を 1.5 秒鳴らすだけの WAV を作る
@@ -78,7 +80,7 @@ try {
     Write-Host 'linger を 300 秒に設定した（満了による終了を排除するため）' -ForegroundColor Cyan
     Write-Host ''
 
-    Get-Process minply -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process minply -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
     Start-Sleep -Milliseconds 800
 
     Write-Host '=== 手順 1: 現在のデバイスで再生する ===' -ForegroundColor Yellow
@@ -123,7 +125,7 @@ try {
     }
 }
 finally {
-    Get-Process minply -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process minply -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
     Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
     if ($hadCfg) { Set-Content -Path $localCfg -Value $savedCfg -NoNewline }
     else { Remove-Item $localCfg -ErrorAction SilentlyContinue }

@@ -87,12 +87,14 @@ function Invoke-Minply {
     }
 }
 
+# out\minply.exe のプロセスだけを対象にする
+# プロセス名で選ぶと、別の場所に常駐しているユーザ自身のトレイまで巻き込む
 function Get-ServerPids {
-    return @(Get-Process minply -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+    return @(Get-Process minply -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Select-Object -ExpandProperty Id)
 }
 
 function Stop-Servers {
-    Get-Process minply -ErrorAction SilentlyContinue | Stop-Process -Force
+    Get-Process minply -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
     Start-Sleep -Milliseconds 800
 }
 

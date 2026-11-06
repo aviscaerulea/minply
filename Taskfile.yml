@@ -55,7 +55,8 @@ tasks:
   rebuild:
     desc: 実行中のバイナリを停止し、クリーンビルドして再起動する
     cmds:
-      - cmd: taskkill /F /IM minply.exe
+      # out 配下の exe だけを止める。taskkill /IM はユーザ自身の常駐トレイまで止めてしまう
+      - cmd: pwsh -NoProfile -Command "Get-Process minply -ErrorAction SilentlyContinue | Where-Object Path -eq (Resolve-Path '{{.OUT_DIR}}/minply.exe').Path | Stop-Process -Force"
         ignore_error: true
       - task: clean
       - task: build
