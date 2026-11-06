@@ -821,7 +821,8 @@ static bool DecodeInput(const BYTE* data, size_t size, const WAVEFORMATEX* mixFo
 //
 // Only reads when stdin is a pipe or redirected file to avoid blocking on
 // interactive console input. Switches to binary mode to prevent CRLF translation.
-// Returns false if stdin is not redirected, on read error, or no data was read.
+// Returns false if stdin is not redirected, on read error, no data was read, or
+// the input exceeds the 4GB cap or available memory (the last two also log an error).
 bool ReadAllStdin(std::vector<BYTE>& buffer) {
     HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
     if (!hStdin || hStdin == INVALID_HANDLE_VALUE) return false;
@@ -851,7 +852,16 @@ bool ReadAllStdin(std::vector<BYTE>& buffer) {
             PrintError("stdin input exceeds 4GB limit");
             return false;
         }
-        buffer.insert(buffer.end(), chunk, chunk + bytesRead);
+        // Input under the 4GB cap can still exhaust memory; report it like the
+        // oversized case instead of dying on an uncaught exception, which would
+        // break the 0-5 exit code contract
+        try {
+            buffer.insert(buffer.end(), chunk, chunk + bytesRead);
+        }
+        catch (const std::bad_alloc&) {
+            PrintError("stdin input too large for memory");
+            return false;
+        }
     }
     return !buffer.empty();
 }
