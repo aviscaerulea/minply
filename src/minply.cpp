@@ -590,7 +590,13 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
     }
 
     // Opus stream structure: packet 1 = OpusHead, packet 2 = OpusTags, packet 3+ = audio data
-    while (ogg_sync_pageout(&oy, &og) == 1) {
+    // ogg_sync_pageout returns -1 after skipping bytes to recapture sync (a hole
+    // or a CRC-failed page) and 0 only when the data is exhausted. Keep reading
+    // on -1 so a damaged page drops only itself instead of silently truncating
+    // the rest of the stream
+    int pageResult;
+    while ((pageResult = ogg_sync_pageout(&oy, &og)) != 0) {
+        if (pageResult < 0) continue;
         if (!streamInitialized) {
             if (ogg_stream_init(&os, ogg_page_serialno(&og)) != 0) {
                 ogg_sync_clear(&oy);
