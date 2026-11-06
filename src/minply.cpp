@@ -2076,11 +2076,18 @@ static int RunServer(const wchar_t* sessionId) {
                                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                                    1, PIPE_BUFFER_HINT, PIPE_BUFFER_HINT, 0, nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
-        // Another server already owns this session id
+        // ERROR_PIPE_BUSY (the single instance is taken) and ERROR_ACCESS_DENIED
+        // (FILE_FLAG_FIRST_PIPE_INSTANCE) both mean another server already owns
+        // this session id, which is the normal outcome of the election. Any
+        // other cause (resource exhaustion etc.) is a real startup failure that
+        // the client cannot see, so it must reach the log
+        DWORD err = GetLastError();
         CoTaskMemFree(mixFormat);
         MFShutdown();
         CoUninitialize();
-        return EXIT_SUCCESS;
+        if (err == ERROR_PIPE_BUSY || err == ERROR_ACCESS_DENIED) return EXIT_SUCCESS;
+        PrintError(("Failed to create session pipe (error " + std::to_string(err) + ")").c_str());
+        return ERR_PLAYBACK_FAILED;
     }
 
     ServerState state;
