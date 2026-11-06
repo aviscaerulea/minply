@@ -2018,20 +2018,27 @@ static DWORD WINAPI RenderThreadProc(LPVOID param) {
 // config.lingerDuration seconds without a client. Creating the pipe with
 // FILE_FLAG_FIRST_PIPE_INSTANCE doubles as the single-server election: a second
 // server for the same id fails here and exits quietly.
+// Startup failures go through PrintError: the detached server has no visible
+// stderr, and the client only observes a pipe that never appears.
 static int RunServer(const wchar_t* sessionId) {
     AppConfig config = LoadConfig();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (FAILED(hr)) return ERR_WASAPI_INIT;
+    if (FAILED(hr)) {
+        PrintError("Failed to initialize COM");
+        return ERR_WASAPI_INIT;
+    }
 
     hr = MFStartup(MF_VERSION);
     if (FAILED(hr)) {
+        PrintError("Failed to initialize Media Foundation");
         CoUninitialize();
         return ERR_DECODE_FAILED;
     }
 
     WAVEFORMATEX* mixFormat = nullptr;
     if (!GetDeviceMixFormat(&mixFormat)) {
+        PrintError("Failed to get device format");
         MFShutdown();
         CoUninitialize();
         return ERR_WASAPI_INIT;
@@ -2039,6 +2046,7 @@ static int RunServer(const wchar_t* sessionId) {
     // The render thread writes raw float frames; refuse a device whose mix
     // format has any other layout instead of corrupting the WASAPI buffer
     if (!IsFloat32MixFormat(mixFormat)) {
+        PrintError("Unsupported device mix format");
         CoTaskMemFree(mixFormat);
         MFShutdown();
         CoUninitialize();
@@ -2071,18 +2079,21 @@ static int RunServer(const wchar_t* sessionId) {
 
     do {
         if (!state.doneEvent || !state.readyEvent) {
+            PrintError("Failed to create server event");
             exitCode = ERR_WASAPI_INIT;
             break;
         }
 
         connEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
         if (!connEvent) {
+            PrintError("Failed to create server event");
             exitCode = ERR_WASAPI_INIT;
             break;
         }
 
         renderThread = CreateThread(nullptr, 0, RenderThreadProc, &state, 0, nullptr);
         if (!renderThread) {
+            PrintError("Failed to create render thread");
             exitCode = ERR_WASAPI_INIT;
             break;
         }
@@ -2091,6 +2102,7 @@ static int RunServer(const wchar_t* sessionId) {
         // strand clients, which can already connect to the pipe created above
         if (WaitForSingleObject(state.readyEvent, SERVER_INIT_TIMEOUT_MS) != WAIT_OBJECT_0
             || !state.renderOk) {
+            PrintError("Render thread failed to start");
             exitCode = ERR_WASAPI_INIT;
             break;
         }
