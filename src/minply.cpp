@@ -670,6 +670,9 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
 //
 // Wraps the buffer as a seekable IStream (SHCreateMemStream) and feeds it to
 // MFSourceReader. Seekability is required by most MF decoders (MP3, AAC, FLAC, etc.).
+// Never lets an allocation failure escape: every MF object is released and the
+// call reports a plain decode failure, so the linger server stays leak-free
+// when a request exhausts memory.
 bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decodedData,
                        UINT32 targetSampleRate, UINT32 targetChannels) {
     HRESULT hr;
@@ -728,6 +731,9 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
             break;
         }
 
+        // Set when the output buffer cannot grow; the loop ends after the
+        // current sample is released so the cleanup below still runs
+        bool allocFailed = false;
         while (true) {
             DWORD flags = 0;
             IMFSample* sample = nullptr;
@@ -767,14 +773,21 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
                         // an empty buffer has no element at oldSize to take the address of
                         if (sampleCount > 0) {
                             size_t oldSize = decodedData.size();
-                            decodedData.resize(oldSize + sampleCount);
-                            memcpy(&decodedData[oldSize], bufData, sampleCount * sizeof(float));
+                            try {
+                                decodedData.resize(oldSize + sampleCount);
+                                memcpy(&decodedData[oldSize], bufData, sampleCount * sizeof(float));
+                            }
+                            catch (const std::bad_alloc&) {
+                                allocFailed = true;
+                                decodedData.clear();
+                            }
                         }
                         buffer->Unlock();
                     }
                     buffer->Release();
                 }
                 sample->Release();
+                if (allocFailed) break;
             }
         }
 
