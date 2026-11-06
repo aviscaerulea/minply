@@ -540,15 +540,16 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
     std::vector<float> output(dstFrames * dstChannels);
 
     for (size_t i = 0; i < dstFrames; i++) {
-        float srcIndex = static_cast<float>(i * srcRate) / dstRate;
-        // The float division rounds twice, so srcIndex can land one frame past
-        // the true value on long inputs. Equal-rate paths have zero headroom
-        // (dstFrames == srcFrames), so clamp like idx1 to stay in bounds.
-        // frac may reach 1.0, but then idx1 == idx0 makes s1 == s0 and the
-        // interpolated value stays the last sample.
-        size_t idx0 = (std::min)(static_cast<size_t>(srcIndex), srcFrames - 1);
+        // Source position as an exact integer quotient and remainder: a float
+        // division drifted up to a whole frame on long inputs, so an equal-rate
+        // channel conversion no longer maps frame i to frame i. Now frac is 0
+        // whenever srcRate == dstRate. dstFrames is floored from srcFrames, so
+        // pos / dstRate never exceeds srcFrames - 1; the clamp stays as a guard
+        // and idx1 is clamped so interpolation at the last frame reuses it.
+        uint64_t pos = static_cast<uint64_t>(i) * srcRate;
+        size_t idx0 = (std::min)(static_cast<size_t>(pos / dstRate), srcFrames - 1);
         size_t idx1 = (std::min)(idx0 + 1, srcFrames - 1);
-        float frac = srcIndex - idx0;
+        float frac = static_cast<float>(pos % dstRate) / dstRate;
 
         for (UINT32 ch = 0; ch < dstChannels; ch++) {
             UINT32 srcCh = (std::min)(ch, srcChannels - 1);
