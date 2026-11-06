@@ -76,10 +76,13 @@ function New-ToneWav {
 # minply を起動し、そのプロセスの終了だけを待つ
 # WINDOWS サブシステムの exe は通常起動では待てないため WaitForExit を明示する
 # パラメータ名に Args は使えない（PowerShell の自動変数と衝突して束縛が壊れる）
+# -ArgumentList は要素を空白で連結するだけで引用符を付けないため、空白を含む
+# パスが分割されないよう各要素を " で囲む（Windows のパスに " は含められない）
 function Invoke-Minply {
     param([string[]]$ArgList)
     $t = Get-Date
-    $p = Start-Process -FilePath $exe -ArgumentList $ArgList -PassThru -NoNewWindow
+    $quoted = $ArgList | ForEach-Object { '"' + $_ + '"' }
+    $p = Start-Process -FilePath $exe -ArgumentList $quoted -PassThru -NoNewWindow
     $p.WaitForExit()
     return [pscustomobject]@{
         Exit = $p.ExitCode
@@ -163,8 +166,8 @@ try {
 
     Stop-Servers
     $t = Get-Date
-    $x = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB1', $wavLow)  -PassThru -NoNewWindow
-    $y = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB2', $wavHigh) -PassThru -NoNewWindow
+    $x = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB1', "`"$wavLow`"")  -PassThru -NoNewWindow
+    $y = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB2', "`"$wavHigh`"") -PassThru -NoNewWindow
     $x.WaitForExit(); $y.WaitForExit()
     Write-Host ("  exit={0},{1} / 合計 {2}s / サーバ {3} 個 (並行なら 2 個、約 4s 以内)" -f `
         $x.ExitCode, $y.ExitCode, [math]::Round(((Get-Date) - $t).TotalSeconds, 2), (Get-ServerPids).Count)
@@ -178,8 +181,8 @@ try {
     Write-Host '--- 参考: 同一 ID では直列になるはず ---' -ForegroundColor DarkGray
     Stop-Servers
     $t = Get-Date
-    $x = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB3', $wavLow)  -PassThru -NoNewWindow
-    $y = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB3', $wavHigh) -PassThru -NoNewWindow
+    $x = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB3', "`"$wavLow`"")  -PassThru -NoNewWindow
+    $y = Start-Process -FilePath $exe -ArgumentList @('--session', 'verifyB3', "`"$wavHigh`"") -PassThru -NoNewWindow
     $x.WaitForExit(); $y.WaitForExit()
     Write-Host ("  exit={0},{1} / 合計 {2}s (直列なら B より明らかに長い)" -f `
         $x.ExitCode, $y.ExitCode, [math]::Round(((Get-Date) - $t).TotalSeconds, 2))

@@ -24,10 +24,16 @@ $work = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandom
 New-Item -ItemType Directory -Path $work | Out-Null
 $wav = Join-Path $work 'switch.wav'
 
+# minply を起動し、そのプロセスの終了だけを待つ
+# WINDOWS サブシステムの exe は通常起動では待てないため WaitForExit を明示する
+# パラメータ名に Args は使えない（PowerShell の自動変数と衝突して束縛が壊れる）
+# -ArgumentList は要素を空白で連結するだけで引用符を付けないため、空白を含む
+# パスが分割されないよう各要素を " で囲む（Windows のパスに " は含められない）
 function Invoke-Minply {
     param([string[]]$ArgList)
     $t = Get-Date
-    $p = Start-Process -FilePath $exe -ArgumentList $ArgList -PassThru -NoNewWindow
+    $quoted = $ArgList | ForEach-Object { '"' + $_ + '"' }
+    $p = Start-Process -FilePath $exe -ArgumentList $quoted -PassThru -NoNewWindow
     $p.WaitForExit()
     return [pscustomobject]@{
         Exit = $p.ExitCode
