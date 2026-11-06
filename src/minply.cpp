@@ -563,6 +563,10 @@ std::vector<float> ConvertFormat(const std::vector<float>& input,
 }
 
 // Decode Opus/Ogg data from buffer (.opus and .ogg Opus)
+//
+// Never lets an allocation failure escape: the ogg sync/stream states and the
+// Opus decoder are released and the call reports a plain decode failure, so
+// the linger server stays leak-free when a request exhausts memory.
 bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audioData,
                          UINT32 targetSampleRate, UINT32 targetChannels) {
     ogg_sync_state   oy;
@@ -611,6 +615,10 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
         // after a damaged page, and 0 only when the page has no more packets.
         // Skip the marker instead of stopping: the page's real packets follow
         // it, and when this is the last page nothing would read them later
+        //
+        // allocFailed is set when the output buffer cannot grow; both loops end
+        // so the cleanup below still runs and the empty result reports failure
+        bool allocFailed = false;
         int packetResult;
         while ((packetResult = ogg_stream_packetout(&os, &op)) != 0) {
             if (packetResult < 0) continue;
@@ -652,12 +660,20 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
                                                       pcmBuffer.data(), OPUS_MAX_FRAME_SIZE, 0);
                     if (frameSize > 0) {
                         size_t sampleCount = static_cast<size_t>(frameSize) * opusChannels;
-                        decodedFloat.insert(decodedFloat.end(),
-                                            pcmBuffer.data(), pcmBuffer.data() + sampleCount);
+                        try {
+                            decodedFloat.insert(decodedFloat.end(),
+                                                pcmBuffer.data(), pcmBuffer.data() + sampleCount);
+                        }
+                        catch (const std::bad_alloc&) {
+                            allocFailed = true;
+                            decodedFloat.clear();
+                            break;
+                        }
                     }
                 }
             }
         }
+        if (allocFailed) break;
     }
 
     if (decoder) opus_decoder_destroy(decoder);
