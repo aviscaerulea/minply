@@ -1,7 +1,7 @@
 /*
  * minply - Minimal Audio Player
  *
- * Lightweight and fast audio player with BLE receiver lag compensation
+ * Lightweight and fast audio player with Bluetooth receiver lag compensation
  *
  * Usage:
  *   minply.exe [--session <id>] [audio file path | -]
@@ -10,7 +10,7 @@
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
  *   - Accepts audio data from stdin (no argument or - as argument)
- *   - Plays inaudible 19kHz guard tone before/after audio (BLE anti-clipping)
+ *   - Plays inaudible 19kHz guard tone before/after audio (Bluetooth anti-clipping)
  *   - --session <id> keeps a linger server alive so consecutive playbacks of the
  *     same session skip the lead-in entirely (uninterrupted guard tone)
  *   - Skips playback (exit 0) while a mute condition holds: a configured
@@ -85,8 +85,8 @@
 #define ERR_PLAYBACK_FAILED   5
 
 // Constants
-constexpr float LEAD_IN_DURATION = 1.2f;    // Lead-in duration in seconds; BLE wake-up (~700ms) + WASAPI session startup noise margin
-constexpr float LEAD_OUT_DURATION = 1.2f;   // Lead-out duration in seconds; keep BLE active until audio tail drains through SBC codec pipeline
+constexpr float LEAD_IN_DURATION = 1.2f;    // Lead-in duration in seconds; Bluetooth wake-up (~700ms) + WASAPI session startup noise margin
+constexpr float LEAD_OUT_DURATION = 1.2f;   // Lead-out duration in seconds; keep the Bluetooth receiver active until audio tail drains through SBC codec pipeline
 constexpr float BLE_GUARD_FREQ = 19000.0f;  // Guard tone frequency in Hz (inaudible to adults)
 constexpr float BLE_GUARD_AMP = 0.001f;     // Guard tone amplitude (~-60dB)
 constexpr float TWO_PI = 6.2831853f;        // 2π
@@ -844,9 +844,9 @@ bool ReadAllStdin(std::vector<BYTE>& buffer) {
     return !buffer.empty();
 }
 
-// Generate inaudible sine wave buffer for BLE anti-clipping
-// BLE devices enter power-saving mode on digital silence, causing audio clipping.
-// A 19kHz tone at ~-60dB is inaudible to adults but keeps the BLE codec active.
+// Generate inaudible sine wave buffer for Bluetooth anti-clipping
+// Bluetooth receivers enter power-saving mode on digital silence, causing audio clipping.
+// A 19kHz tone at ~-60dB is inaudible to adults but keeps the Bluetooth codec active.
 std::vector<float> GenerateBleGuard(UINT32 sampleRate, UINT32 channels, float duration,
                                      float freq, float amp) {
     size_t totalFrames = static_cast<size_t>(sampleRate * duration);
@@ -1043,7 +1043,7 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
             break;
         }
 
-        // Play lead-in (BLE guard), main audio, then lead-out (BLE guard)
+        // Play lead-in (guard tone), main audio, then lead-out (guard tone)
         const std::vector<float>* sources[] = { &leadIn, &audioData, &leadOut };
         bool playbackAborted = false;
         for (const auto* source : sources) {
