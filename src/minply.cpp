@@ -755,9 +755,14 @@ bool DecodeAudioBuffer(const BYTE* data, size_t size, std::vector<float>& decode
                     hr = buffer->Lock(&bufData, nullptr, &dataLen);
                     if (SUCCEEDED(hr)) {
                         size_t sampleCount = dataLen / sizeof(float);
-                        size_t oldSize = decodedData.size();
-                        decodedData.resize(oldSize + sampleCount);
-                        memcpy(&decodedData[oldSize], bufData, dataLen);
+                        // Copy whole floats only: a length that is not a multiple of
+                        // sizeof(float) would otherwise write past the resized buffer, and
+                        // an empty buffer has no element at oldSize to take the address of
+                        if (sampleCount > 0) {
+                            size_t oldSize = decodedData.size();
+                            decodedData.resize(oldSize + sampleCount);
+                            memcpy(&decodedData[oldSize], bufData, sampleCount * sizeof(float));
+                        }
                         buffer->Unlock();
                     }
                     buffer->Release();
