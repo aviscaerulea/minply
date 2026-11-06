@@ -607,7 +607,13 @@ bool TryDecodeOpusBuffer(const BYTE* data, size_t size, std::vector<float>& audi
         }
         ogg_stream_pagein(&os, &og);
 
-        while (ogg_stream_packetout(&os, &op) == 1) {
+        // ogg_stream_packetout returns -1 once for the gap marker libogg inserts
+        // after a damaged page, and 0 only when the page has no more packets.
+        // Skip the marker instead of stopping: the page's real packets follow
+        // it, and when this is the last page nothing would read them later
+        int packetResult;
+        while ((packetResult = ogg_stream_packetout(&os, &op)) != 0) {
+            if (packetResult < 0) continue;
             packetCount++;
 
             if (packetCount == 1) {
