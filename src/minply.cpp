@@ -2429,8 +2429,8 @@ static int RunClient(const wchar_t* sessionId, const std::vector<BYTE>& inputDat
 // The tray only owns the manual mute (the waitable timer named by
 // MANUAL_MUTE_TIMER_NAME) and the menu-toggled settings in the registry.
 // Condition mutes are evaluated by each player itself, so they work without
-// the tray. The tray keeps no state across restarts: a restart forgets the
-// manual mute by design.
+// the tray. Across tray restarts the registry settings persist, while the
+// manual mute is forgotten by design.
 
 constexpr UINT    WM_TRAYICON            = WM_APP + 1;   // Shell_NotifyIcon callback message
 constexpr wchar_t TRAY_WINDOW_CLASS[]    = L"minply_tray";      // Window class of the hidden tray window
