@@ -132,6 +132,10 @@ constexpr DWORD  PIPE_BUFFER_HINT         = 65536;   // Named pipe in/out buffer
 constexpr DWORD  PIPE_IO_TIMEOUT_MS       = 30000;   // Per-operation cap so a dead client cannot block the server forever
 constexpr size_t PIPE_CHUNK               = 65536;   // Transfer chunk size over the session pipe
 constexpr size_t SESSION_ID_MAX           = 64;      // Session id length cap (kernel object name safety)
+
+// Log retention ([log] retention_days): days of daily logs kept, today included; 0 keeps all
+constexpr int    LOG_RETENTION_DAYS       = 7;
+constexpr int    LOG_RETENTION_DAYS_MAX   = 3650;
 constexpr uint64_t PIPE_MAX_DATA          = 256ULL * 1024 * 1024;  // Request payload cap; far above any notification sound, keeps a hostile client from forcing huge allocations
 constexpr DWORD  CLIENT_RESPONSE_TIMEOUT_MS = 600000;  // Client-side cap on waiting for its own playback result (covers long audio)
 constexpr DWORD  SERVER_PLAY_MARGIN_MS    = 30000;   // Extra wait margin for the render thread to finish one audio
@@ -209,6 +213,7 @@ struct AppConfig {
     float loudnessTarget      = LOUDNESS_TARGET;
     float loudnessPeakCeiling = LOUDNESS_PEAK_CEILING;
     float lingerDuration      = LINGER_DURATION;
+    int   logRetentionDays    = LOG_RETENTION_DAYS;
     std::vector<std::wstring>   muteProcesses;
     std::vector<MuteWindowRule> muteWindows;
     std::vector<MuteDuration>   muteDurations = DefaultMuteDurations();
@@ -314,6 +319,58 @@ void PrintError(const char* message) {
 static void PrintWarning(const std::string& message) {
     std::cerr << "Warning: " << message << std::endl;
     WriteLog("Warning: " + message);
+}
+
+// Whether a file name has the daily log form "YYYY-MM-DD.log"
+static bool IsDailyLogName(const wchar_t* name) {
+    if (wcslen(name) != 14 || _wcsicmp(name + 10, L".log") != 0) return false;
+    for (int i = 0; i < 10; i++) {
+        const bool dash = (i == 4 || i == 7);
+        if (dash ? name[i] != L'-' : !iswdigit(name[i])) return false;
+    }
+    return true;
+}
+
+// Delete daily logs older than the newest retentionDays days (today included)
+//
+// Called once when the tray starts: the tray runs from logon when startup is
+// registered, which is often enough to bound the folder, and players stay
+// free of the extra directory scan. retentionDays 0 keeps every log. Only
+// files named YYYY-MM-DD.log are touched; anything else in the folder stays.
+// Dates are compared as zero-padded strings, which orders them correctly.
+// Delete failures (e.g. a file open in an editor) are ignored and retried at
+// the next tray start.
+static void PruneOldLogs(int retentionDays) {
+    if (retentionDays <= 0) return;
+    std::wstring dir = GetLogDir();
+    if (dir.empty()) return;
+
+    // Cutoff = today - (retentionDays - 1); local time on both sides, so no TZ conversion
+    SYSTEMTIME today;
+    GetLocalTime(&today);
+    FILETIME ft;
+    SystemTimeToFileTime(&today, &ft);
+    ULONGLONG t = (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    t -= static_cast<ULONGLONG>(retentionDays - 1) * 24 * 3600 * 10000000ULL;
+    ft.dwLowDateTime  = static_cast<DWORD>(t);
+    ft.dwHighDateTime = static_cast<DWORD>(t >> 32);
+    SYSTEMTIME cut;
+    FileTimeToSystemTime(&ft, &cut);
+    wchar_t cutoff[16];
+    swprintf_s(cutoff, L"%04u-%02u-%02u", cut.wYear, cut.wMonth, cut.wDay);
+
+    WIN32_FIND_DATAW fd;
+    HANDLE find = FindFirstFileW((dir + L"\\*.log").c_str(), &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    int deleted = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!IsDailyLogName(fd.cFileName)) continue;
+        if (wcsncmp(fd.cFileName, cutoff, 10) >= 0) continue;
+        if (DeleteFileW((dir + L"\\" + fd.cFileName).c_str())) deleted++;
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    if (deleted > 0) WriteLog("pruned " + std::to_string(deleted) + " old log file(s)");
 }
 
 // Validate a session id
@@ -1335,7 +1392,7 @@ static std::vector<MuteDuration> DefaultMuteDurations() {
 // Parse a subset of TOML into config.
 //
 // Supported: [section] headers, the [[mute.window]] array-of-tables header,
-// and bool / float / string / one-line string-array values. Unknown sections
+// and bool / integer / float / string / one-line string-array values. Unknown sections
 // and keys are silently ignored.
 // Returns false when the file cannot be opened, its size cannot be obtained,
 // it exceeds the 1MB cap, or the read fails. The size-cap case also warns
@@ -1443,6 +1500,16 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             }
             dest = v;
         };
+        // Parse and range-check an integer value; same rejection rules as parseFloat
+        auto parseInt = [&](int& dest, int minVal, int maxVal) {
+            char* end;
+            long v = strtol(val.c_str(), &end, 10);
+            if (end == val.c_str() || *end != '\0' || v < minVal || v > maxVal) {
+                PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
+                return;
+            }
+            dest = static_cast<int>(v);
+        };
 
         if (section == "guard") {
             if      (key == "enabled")          parseBool(config.guardEnabled);
@@ -1458,6 +1525,9 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         }
         else if (section == "linger") {
             if (key == "duration") parseFloat(config.lingerDuration, 1.0f, 600.0f);
+        }
+        else if (section == "log") {
+            if (key == "retention_days") parseInt(config.logRetentionDays, 0, LOG_RETENTION_DAYS_MAX);
         }
         else if (section == "mute") {
             if (key == "processes") {
@@ -2899,7 +2969,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// Run the tray: create the manual mute timer, show the icon, pump messages
+// Run the tray: create the manual mute timer, prune old logs, show the icon, pump messages
 //
 // A second tray finds the timer already present and exits 0 at once (the
 // first one keeps running). The window is a hidden top-level window, not a
@@ -2922,6 +2992,7 @@ static int RunTray() {
 
     AppConfig config = LoadConfig();
     g_tray.durations = config.muteDurations;
+    PruneOldLogs(config.logRetentionDays);
 
     // ShellExecuteW may use COM-based shell extensions; it expects an STA
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -3193,32 +3264,37 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     else {
         const wchar_t* filePath = pathArg;
+        // File errors name the path: the log is read later, away from the
+        // command line, and would not tell which file failed otherwise
+        auto fileError = [filePath](const char* message) {
+            PrintError((std::string(message) + ": " + WideToUtf8(filePath)).c_str());
+        };
         if (GetFileAttributesW(filePath) == INVALID_FILE_ATTRIBUTES) {
-            PrintError("File not found");
+            fileError("File not found");
             return ERR_FILE_NOT_FOUND;
         }
         HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (hFile == INVALID_HANDLE_VALUE) {
-            PrintError("File not found");
+            fileError("File not found");
             return ERR_FILE_NOT_FOUND;
         }
         LARGE_INTEGER fileSize;
         if (!GetFileSizeEx(hFile, &fileSize)) {
             CloseHandle(hFile);
-            PrintError("Failed to read file");
+            fileError("Failed to read file");
             return ERR_FILE_NOT_FOUND;
         }
         if (fileSize.QuadPart == 0) {
             CloseHandle(hFile);
-            PrintError("File is empty");
+            fileError("File is empty");
             return ERR_FILE_NOT_FOUND;
         }
         // Guard against 4GB+ files: ReadFile takes DWORD, and notification sounds
         // never approach this size in practice
         if (fileSize.QuadPart > MAXDWORD) {
             CloseHandle(hFile);
-            PrintError("File too large");
+            fileError("File too large");
             return ERR_DECODE_FAILED;
         }
         // The size passed the MAXDWORD check above but may still exceed available
@@ -3229,7 +3305,7 @@ int wmain(int argc, wchar_t* argv[]) {
         }
         catch (const std::bad_alloc&) {
             CloseHandle(hFile);
-            PrintError("File too large");
+            fileError("File too large");
             return ERR_DECODE_FAILED;
         }
         DWORD toRead = static_cast<DWORD>(fileSize.QuadPart);
@@ -3237,7 +3313,7 @@ int wmain(int argc, wchar_t* argv[]) {
         bool readOk = ReadFile(hFile, inputData.data(), toRead, &bytesRead, nullptr);
         CloseHandle(hFile);
         if (!readOk || bytesRead != toRead) {
-            PrintError("Failed to read file");
+            fileError("Failed to read file");
             return ERR_FILE_NOT_FOUND;
         }
     }

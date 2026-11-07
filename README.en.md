@@ -129,7 +129,7 @@ The manual mute is released when the tray exits. The microphone/camera setting a
 
 ### Log
 
-Errors and configuration file warnings are written to standard error and also appended, one line each, to `logs\YYYY-MM-DD.log` in the same folder as `minply.exe`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play.
+Errors and configuration file warnings are written to standard error and also appended, one line each, to `logs\YYYY-MM-DD.log` in the same folder as `minply.exe`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play. Each time the tray starts, old logs are deleted, keeping the last 7 days by default.
 
 ## Configuration
 
@@ -145,6 +145,7 @@ The meaning and default value of each item are documented in the comments inside
 | `loudness` | `enabled` | Whether to even out volume differences between sources |
 | `loudness` | `target` | The loudness to normalize to |
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
+| `log` | `retention_days` | Days of logs kept when the tray starts (0 keeps all) |
 | `mute` | `processes` | Apps (exe names) that suppress playback while running |
 | `mute.window` | `process`, `title` | Suppress playback when a window title of the app matches the regular expression |
 | `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
