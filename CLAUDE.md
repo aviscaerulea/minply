@@ -3,37 +3,35 @@
 ## ドキュメント管理規則
 
 - 機能の追加と変更、仕様の変更は、漏らさず README.md に反映する
-- 仕様、使用方法、動作要件、ビルド方法などは全て README.md に記載する
-- コード変更とドキュメントの更新は同一コミットで行う
+  - 反映の前に README.md を読み、既存の記述と食い違わない形で書く
+- 仕様、使用方法、動作要件、ビルド方法は README.md に記載する
+- コード変更とドキュメントの更新は同一コミットにまとめる
 
-## 開発規則
+## 開発環境
 
-### ビルド環境
+- PowerShell のスクリプトとコマンドは pwsh.exe（PowerShell 7 以降）で実行する
+- build.ps1 が `Enter-VsDevShell` で Visual Studio の開発環境を読み込むため、事前の有効化は要らない
 
-- PowerShell は pwsh.exe（PowerShell 7+）を使用
-- Visual Studio 開発環境は build.ps1 が `Enter-VsDevShell` で自動ロードするため、事前の有効化は不要
-- Task による自動ビルドスクリプトを優先使用
+## ビルド方法
 
-### ビルド＆テスト手順
+- `task build` でビルドする（手順の詳細は README.md の「ビルド」節）
 
-- ビルド: `task build`
-- テスト: `.\test.bat`（PowerShell から実行）
+## テスト方法
 
-### リリース手順
+- PowerShell から `.\test.bat` を実行する
 
-- アセット命名: `minply-{version}-x64.zip`（exe + toml + `package/minply.local.toml` 同梱）
-- バージョニング: 機能追加は minor、バグ修正は patch
+## リリース
 
-### コーディング規則
+- アセット名：`minply-{version}-x64.zip`（exe、minply.toml、`package/minply.local.toml` を同梱）
+- バージョニング：機能追加は minor、バグ修正は patch を上げる
 
-- C++ のコーディングスタイルは既存コードに準拠
-- エラーハンドリングは終了コードで明確に区別（0-5 の範囲）
-- パフォーマンスと軽量性を重視（実行ファイルサイズに注意）
-- MSVC の `std::min`/`std::max` は型を厳密に一致させる（`DWORD` と `unsigned int` 混在不可）
+## 実装上の注意点
 
-### 設計制約
-
-- Bluetooth レシーバのスリープ回避のため WASAPI セッションは分割しない（単一セッション内でガードトーン→本編→ガードトーンを順次再生）
+- C++ のコーディングスタイルは既存コードに合わせる
+- エラーは README.md の「終了コード」節の 0〜5 で種類ごとに区別して返す
+- 実行速度と軽量性を重視し、実行ファイルのサイズを抑える
+- MSVC の `std::min`/`std::max` には同じ型の引数を渡す（`DWORD` と `unsigned int` も混ぜない）
+- Bluetooth レシーバのスリープを避けるため、ガードトーン、本編、ガードトーンを 1 つの WASAPI セッションで順に再生する（セッションを分けない）
 
 ## 参考
 
