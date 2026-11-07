@@ -31,6 +31,6 @@ jobs:
           Compress-Archive -Path out/minply.exe, minply.toml -DestinationPath "minply-$version-x64.zip"
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: minply-*-x64.zip
