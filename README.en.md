@@ -109,10 +109,12 @@ Starting `minply.exe --tray` keeps minply resident in the notification area. The
 
 | Operation | Description |
 | --- | --- |
-| Manual mute | Silences playback with no time limit, or for a configured time (30 minutes, 60 minutes, 90 minutes, or 12 hours by default). The icon shows a red slash while muted |
+| Manual mute | Silences playback with no time limit, or for a configured time (30 minutes, 60 minutes, 90 minutes, or 12 hours by default) |
 | Mute while a microphone or camera is in use | Silences playback while a microphone or camera is in use, such as during a meeting (off by default) |
 | Startup registration | Starts the tray automatically at sign-in |
 | Open the configuration file, open the log file | Opens each file in its default app |
+
+The icon shows a red slash while a manual mute is on and while a mute condition (a microphone or camera in use, or a rule in the configuration file) is holding playback back. Hovering over the icon shows why playback is held back.
 
 Left-clicking the icon unmutes while any manual mute is on, and otherwise mutes with no time limit.
 
@@ -164,6 +166,7 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
 - The tray setting (`mute_durations`) is read only when the tray starts
+- The red slash for a mute condition appears up to 5 seconds after the condition starts, and disappears with the same delay
 - Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
 - When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
 

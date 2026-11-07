@@ -20,7 +20,8 @@
  *   - --tray stays in the notification area and offers a manual mute
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
- *     on the icon toggles the indefinite mute
+ *     on the icon toggles the indefinite mute; shows the red slash while a
+ *     condition mute holds too, with the reason in the tooltip
  *   - Each play request briefly marks the tray icon with a green dot,
  *     over the red-slashed icon when the request was muted
  *   - Logs mute decisions, errors, config warnings and tray operations to
@@ -1745,7 +1746,8 @@ static bool IsMicCaptureActive() {
 //
 // Registry records first (microphone, then camera), then the WASAPI capture
 // sessions for the microphone only. Initializes COM itself because the mute
-// check runs before playback sets COM up.
+// check runs before playback sets COM up. On a thread that already holds an
+// STA (the tray) the MTA request fails and the existing apartment is used.
 static bool IsMeetingActive() {
     if (IsRegistryDeviceInUse(L"microphone")) return true;
     if (IsRegistryDeviceInUse(L"webcam")) return true;
@@ -1778,13 +1780,21 @@ static BOOL CALLBACK CollectWindowTitle(HWND hwnd, LPARAM param) {
     return TRUE;
 }
 
-// Find a [mute] processes or [[mute.window]] match; returns the reason or an empty string
+// Result of a condition-mute check: log is the English reason for the log
+// ("process Zoom.exe"), label the Japanese text for the tray tooltip
+// ("Zoom.exe 起動中"). Both empty means no match.
+struct MuteMatch {
+    std::string  log;
+    std::wstring label;
+};
+
+// Find a [mute] processes or [[mute.window]] match; returns the match, or an empty MuteMatch
 //
 // One process snapshot serves both checks. Process names compare
 // case-insensitively against the exe file name. Window titles are matched
 // with regex_search, and a regex_error at match time (e.g. complexity limits)
 // counts as no match rather than aborting playback.
-static std::string FindProcessMuteReason(const AppConfig& config) {
+static MuteMatch FindProcessMuteReason(const AppConfig& config) {
     if (config.muteProcesses.empty() && config.muteWindows.empty()) return {};
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1800,7 +1810,8 @@ static std::string FindProcessMuteReason(const AppConfig& config) {
 
     for (const auto& name : config.muteProcesses) {
         for (const auto& p : exeByPid) {
-            if (_wcsicmp(p.second.c_str(), name.c_str()) == 0) return "process " + WideToUtf8(p.second);
+            if (_wcsicmp(p.second.c_str(), name.c_str()) == 0)
+                return { "process " + WideToUtf8(p.second), p.second + L" 起動中" };
         }
     }
 
@@ -1820,7 +1831,9 @@ static std::string FindProcessMuteReason(const AppConfig& config) {
             catch (const std::regex_error&) {
                 matched = false;
             }
-            if (matched) return "window " + WideToUtf8(rule.process) + " /" + WideToUtf8(rule.titlePattern) + "/";
+            if (matched)
+                return { "window " + WideToUtf8(rule.process) + " /" + WideToUtf8(rule.titlePattern) + "/",
+                         rule.process + L" のウィンドウ" };
         }
     }
     return {};
@@ -1834,7 +1847,7 @@ static std::string FindProcessMuteReason(const AppConfig& config) {
 static std::string FindMuteReason(const AppConfig& config) {
     if (IsManualMuted()) return "manual mute";
     if (IsMeetingMuteEnabled() && IsMeetingActive()) return "microphone or camera in use";
-    return FindProcessMuteReason(config);
+    return FindProcessMuteReason(config).log;
 }
 
 // Read exactly size bytes from an overlapped pipe handle
@@ -2584,13 +2597,16 @@ static int RunClient(const wchar_t* sessionId, const std::vector<BYTE>& inputDat
 // The tray only owns the manual mute (the waitable timer named by
 // MANUAL_MUTE_TIMER_NAME) and the menu-toggled settings in the registry.
 // Condition mutes are evaluated by each player itself, so they work without
-// the tray. Across tray restarts the registry settings persist, while the
+// the tray. The tray re-evaluates them every CONDITION_POLL_MS only to show
+// them; players never ask the tray. Across tray restarts the registry settings persist, while the
 // manual mute is forgotten by design.
 
 constexpr UINT    WM_TRAYICON            = WM_APP + 1;   // Shell_NotifyIcon callback message
 constexpr UINT    WM_PLAY_NOTICE         = WM_APP + 2;   // Posted by players per request; wParam non-zero = muted
 constexpr UINT_PTR PLAY_NOTICE_TIMER_ID  = 1;            // SetTimer id that ends the play notice
 constexpr UINT    PLAY_NOTICE_MS         = 3000;         // How long the play notice dot stays on the icon
+constexpr UINT_PTR CONDITION_TIMER_ID    = 2;            // SetTimer id of the condition-mute poll
+constexpr UINT     CONDITION_POLL_MS     = 5000;         // Interval of the condition-mute poll
 constexpr wchar_t TRAY_WINDOW_CLASS[]    = L"minply_tray";      // Window class of the hidden tray window
 constexpr wchar_t GITHUB_URL[]           = L"https://github.com/aviscaerulea/minply";  // Opened by the version menu entry
 constexpr wchar_t REG_RUN_KEY[]          = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";  // HKCU startup programs
@@ -2627,6 +2643,9 @@ struct TrayState {
     ULONGLONG  muteUntil        = 0;         // UTC FILETIME of the timed mute's expiry
     size_t     muteIndex        = 0;         // Menu entry chosen for the timed mute
     std::vector<MuteDuration> durations;
+    AppConfig    config;                     // Mute rules for the condition poll; reloaded when the files change
+    ULONGLONG    configStamp[2]  = {};       // Last-write FILETIME of minply.toml and minply.local.toml (0: absent)
+    std::wstring conditionReason;            // Tooltip text of the active condition mute; empty when none
 };
 static TrayState g_tray;
 
@@ -2758,12 +2777,17 @@ static HICON CreateOverlayIcon(bool slash, bool dot) {
     return result;
 }
 
-// Tooltip for the current manual mute state
+// Tooltip for the current mute state
 //
 // "minply", "minply：ミュート中（無期限）", or "minply：ミュート中（14:30 まで）";
 // an expiry on another day shows the date too ("11/6 2:30 まで").
+// "minply：ミュート中（マイク/カメラ使用中）" while only a condition mute holds;
+// the manual mute text wins when both hold.
 static std::wstring TrayTooltip() {
-    if (g_tray.mute == ManualMute::None) return L"minply";
+    if (g_tray.mute == ManualMute::None) {
+        if (g_tray.conditionReason.empty()) return L"minply";
+        return L"minply：ミュート中（" + g_tray.conditionReason + L"）";
+    }
     if (g_tray.mute == ManualMute::Indefinite) return L"minply：ミュート中（無期限）";
 
     SYSTEMTIME until = FileTimeToLocal(g_tray.muteUntil);
@@ -2777,7 +2801,7 @@ static std::wstring TrayTooltip() {
     return buf;
 }
 
-// Icon for the current state: a play notice wins over the manual mute state
+// Icon for the current state: a play notice wins over the mute state
 //
 // A missing overlay icon (GDI failure at startup) falls back to the icon
 // without that overlay.
@@ -2787,7 +2811,8 @@ static HICON TrayCurrentIcon() {
         return g_tray.iconMutedPlayed ? g_tray.iconMutedPlayed : muted;
     if (g_tray.notice == PlayNotice::Played)
         return g_tray.iconPlayed ? g_tray.iconPlayed : g_tray.iconNormal;
-    return g_tray.mute != ManualMute::None ? muted : g_tray.iconNormal;
+    const bool mutedNow = g_tray.mute != ManualMute::None || !g_tray.conditionReason.empty();
+    return mutedNow ? muted : g_tray.iconNormal;
 }
 
 // Add (NIM_ADD) or refresh (NIM_MODIFY) the tray icon to match the current state
@@ -2811,6 +2836,47 @@ static void TrayUpdateIcon(DWORD message) {
 static void TrayEndPlayNotice() {
     KillTimer(g_tray.hwnd, PLAY_NOTICE_TIMER_ID);
     g_tray.notice = PlayNotice::None;
+}
+
+// Last-write times of minply.toml and minply.local.toml next to the exe
+//
+// A missing file yields 0, so creating or deleting minply.local.toml counts
+// as a change too.
+static void ConfigFileStamp(ULONGLONG stamp[2]) {
+    const std::wstring dir = GetExeDir();
+    const wchar_t* names[2] = { L"minply.toml", L"minply.local.toml" };
+    for (int i = 0; i < 2; i++) {
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        stamp[i] = 0;
+        if (!dir.empty() && GetFileAttributesExW((dir + names[i]).c_str(), GetFileExInfoStandard, &data))
+            stamp[i] = (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime;
+    }
+}
+
+// Re-evaluate the condition mutes for the icon; true when the tooltip text changed
+//
+// Mirrors the player's FindMuteReason minus the manual mute, which the tray
+// holds itself. The config is reloaded first when either file changed, so
+// the icon follows the same rules a player would read; mute_durations are
+// deliberately left as loaded at startup. IsMeetingActive's MTA
+// initialization fails on this STA thread and the check then runs on the
+// tray's own COM apartment.
+static bool TrayRefreshCondition() {
+    ULONGLONG stamp[2];
+    ConfigFileStamp(stamp);
+    if (stamp[0] != g_tray.configStamp[0] || stamp[1] != g_tray.configStamp[1]) {
+        g_tray.config = LoadConfig();
+        g_tray.configStamp[0] = stamp[0];
+        g_tray.configStamp[1] = stamp[1];
+    }
+
+    std::wstring reason;
+    if (IsMeetingMuteEnabled() && IsMeetingActive()) reason = L"マイク/カメラ使用中";
+    else reason = FindProcessMuteReason(g_tray.config).label;
+
+    if (reason == g_tray.conditionReason) return false;
+    g_tray.conditionReason = reason;
+    return true;
 }
 
 // Tell a running tray that a play request arrived (player side)
@@ -3010,6 +3076,7 @@ static void ShowTrayMenu() {
     }
     else if (cmd == IDM_MUTE_IN_MEETING) {
         ToggleMeetingMute();
+        TrayRefreshCondition();
     }
     else if (cmd == IDM_STARTUP) {
         ToggleStartup();
@@ -3058,6 +3125,9 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
             TrayEndPlayNotice();
             TrayUpdateIcon(NIM_MODIFY);
         }
+        else if (wParam == CONDITION_TIMER_ID && TrayRefreshCondition()) {
+            TrayUpdateIcon(NIM_MODIFY);
+        }
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -3087,9 +3157,10 @@ static int RunTray() {
     g_tray.timer = timer;
     TrayClearMute();   // A new timer starts non-signaled, i.e. muted
 
-    AppConfig config = LoadConfig();
-    g_tray.durations = config.muteDurations;
-    PruneOldLogs(config.logRetentionDays);
+    g_tray.config = LoadConfig();
+    ConfigFileStamp(g_tray.configStamp);
+    g_tray.durations = g_tray.config.muteDurations;
+    PruneOldLogs(g_tray.config.logRetentionDays);
 
     // ShellExecuteW may use COM-based shell extensions; it expects an STA
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -3118,7 +3189,9 @@ static int RunTray() {
     g_tray.iconMutedPlayed = CreateOverlayIcon(true, true);
     // A failed NIM_ADD (notification area not ready yet) is recovered by the
     // TaskbarCreated broadcast sent when the area is created
+    TrayRefreshCondition();
     TrayUpdateIcon(NIM_ADD);
+    SetTimer(g_tray.hwnd, CONDITION_TIMER_ID, CONDITION_POLL_MS, nullptr);
     WriteLog("tray started");
 
     // Wait on the timer only while a timed mute runs: the timer is manual-reset,
