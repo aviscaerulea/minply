@@ -20,8 +20,9 @@
  *   - --tray stays in the notification area and offers a manual mute
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
- *     on the icon toggles the indefinite mute; shows the red slash while a
- *     condition mute holds too, with the reason in the tooltip; a second
+ *     on the icon toggles the indefinite mute; a red slash on the icon tells
+ *     the mute kind (manual "/", condition "\", both "X"), with the reason
+ *     in the tooltip; a second
  *     --tray replaces the running tray
  *   - Each play request briefly marks the tray icon with a green dot,
  *     over the red-slashed icon when the request was muted
@@ -2639,14 +2640,20 @@ enum class ManualMute { None, Timed, Indefinite };
 // Play notice shown for PLAY_NOTICE_MS after the latest play request
 enum class PlayNotice { None, Played, Muted };
 
+// Red slash drawn over the icon, telling which kind of mute holds:
+// Condition "\" (top-left to bottom-right), Manual "/" (bottom-left to top-right),
+// Both the two crossed into an "X". The values index TrayState::overlay.
+enum class SlashMark { None, Condition, Manual, Both };
+constexpr int SLASH_MARK_COUNT = 4;
+
 // Process-wide tray state; the tray runs a single UI thread, so no locking
 struct TrayState {
     HWND       hwnd             = nullptr;
     HANDLE     timer            = nullptr;   // Manual mute timer (see MANUAL_MUTE_TIMER_NAME)
     HICON      iconNormal       = nullptr;
-    HICON      iconMuted        = nullptr;   // Normal icon with a red slash; falls back to iconNormal
-    HICON      iconPlayed       = nullptr;   // Normal icon with the notice dot; falls back to the base icon
-    HICON      iconMutedPlayed  = nullptr;   // Red-slashed icon with the notice dot; same fallback
+    // Overlay variants of the normal icon, indexed [SlashMark][notice dot]; [None][0] stays
+    // nullptr (iconNormal serves), and a nullptr from a GDI failure falls back to the base icon
+    HICON      overlay[SLASH_MARK_COUNT][2] = {};
     UINT       taskbarCreated   = 0;         // Registered "TaskbarCreated" message
     ManualMute mute             = ManualMute::None;
     PlayNotice notice           = PlayNotice::None;
@@ -2679,7 +2686,7 @@ static ULONGLONG NowFileTime() {
 
 // Build a variant of the normal icon with overlays
 //
-// slash: a red slash from top-left to bottom-right (muted). dot: a green dot
+// mark: the red slash for the mute kind (see SlashMark). dot: a green dot
 // at the bottom-right (play notice), drawn over the slash; it is a steady
 // mark, not a blink, so it shows when the icon is looked at without drawing
 // attention otherwise.
@@ -2689,7 +2696,7 @@ static ULONGLONG NowFileTime() {
 // to the shape, which antialiases the edges. Ported from gcalntfy's badge
 // drawing. Returns nullptr on any GDI failure; the caller then falls back to
 // an icon without the overlays.
-static HICON CreateOverlayIcon(bool slash, bool dot) {
+static HICON CreateOverlayIcon(SlashMark mark, bool dot) {
     const int cx = GetSystemMetrics(SM_CXSMICON);
     const int cy = GetSystemMetrics(SM_CYSMICON);
 
@@ -2738,12 +2745,21 @@ static HICON CreateOverlayIcon(bool slash, bool dot) {
             pixels[y * cx + x] = (A << 24) | (R << 16) | (G << 8) | B;
         };
 
-        // Slash geometry, in pixel-center coordinates
-        const float ax = 0.15f * cx, ay = 0.15f * cy;
-        const float bx = 0.85f * cx, by = 0.85f * cy;
+        // Slash geometry, in pixel-center coordinates: both diagonals share the same inset
+        const float lo = 0.15f, hi = 0.85f;
         const float halfWidth = (std::max)(cx / 8.0f, 2.0f) / 2.0f;
-        const float vx = bx - ax, vy = by - ay;
-        const float lenSq = vx * vx + vy * vy;
+        const bool backSlash    = mark == SlashMark::Condition || mark == SlashMark::Both;
+        const bool forwardSlash = mark == SlashMark::Manual    || mark == SlashMark::Both;
+
+        // Coverage of the segment (ax, ay)-(bx, by) at a pixel center, antialiased by distance
+        auto segmentCoverage = [&](float px, float py, float ax, float ay, float bx, float by) {
+            const float vx = bx - ax, vy = by - ay;
+            float t = ((px - ax) * vx + (py - ay) * vy) / (vx * vx + vy * vy);
+            t = (std::min)((std::max)(t, 0.0f), 1.0f);
+            const float dx = px - (ax + t * vx), dy = py - (ay + t * vy);
+            const float d = sqrtf(dx * dx + dy * dy);
+            return (std::min)((std::max)(halfWidth + 0.5f - d, 0.0f), 1.0f);
+        };
 
         // Dot geometry: about two fifths of the icon wide, inset from the bottom-right corner
         const float dotR  = (std::max)(cx * 0.2f, 3.0f);
@@ -2752,14 +2768,13 @@ static HICON CreateOverlayIcon(bool slash, bool dot) {
         for (int y = 0; y < cy; y++) {
             for (int x = 0; x < cx; x++) {
                 const float px = x + 0.5f, py = y + 0.5f;
-                if (slash) {
-                    float t = ((px - ax) * vx + (py - ay) * vy) / lenSq;
-                    t = (std::min)((std::max)(t, 0.0f), 1.0f);
-                    const float dx = px - (ax + t * vx), dy = py - (ay + t * vy);
-                    const float d = sqrtf(dx * dx + dy * dy);
-                    blend(x, y, (std::min)((std::max)(halfWidth + 0.5f - d, 0.0f), 1.0f),
-                          230.0f / 255.0f, 40.0f / 255.0f, 40.0f / 255.0f);
-                }
+                // Union of both strokes, so the crossing of an "X" is not blended twice
+                float slashAlpha = 0.0f;
+                if (backSlash)
+                    slashAlpha = segmentCoverage(px, py, lo * cx, lo * cy, hi * cx, hi * cy);
+                if (forwardSlash)
+                    slashAlpha = (std::max)(slashAlpha, segmentCoverage(px, py, lo * cx, hi * cy, hi * cx, lo * cy));
+                blend(x, y, slashAlpha, 230.0f / 255.0f, 40.0f / 255.0f, 40.0f / 255.0f);
                 if (dot) {
                     const float dx = px - dotCx, dy = py - dotCy;
                     const float d = sqrtf(dx * dx + dy * dy);
@@ -2813,16 +2828,30 @@ static std::wstring TrayTooltip() {
 
 // Icon for the current state: a play notice wins over the mute state
 //
+// The slash follows the mute kinds holding now (manual "/", condition "\",
+// both "X"). A Played notice shows the dot without a slash. A Muted notice
+// keeps the current slash; when the tray sees no mute yet, the player was
+// muted by a condition the poll has not caught up with, so "\" is shown.
 // A missing overlay icon (GDI failure at startup) falls back to the icon
-// without that overlay.
+// without the slash and dot.
 static HICON TrayCurrentIcon() {
-    HICON muted = g_tray.iconMuted ? g_tray.iconMuted : g_tray.iconNormal;
-    if (g_tray.notice == PlayNotice::Muted)
-        return g_tray.iconMutedPlayed ? g_tray.iconMutedPlayed : muted;
-    if (g_tray.notice == PlayNotice::Played)
-        return g_tray.iconPlayed ? g_tray.iconPlayed : g_tray.iconNormal;
-    const bool mutedNow = g_tray.mute != ManualMute::None || !g_tray.conditionReason.empty();
-    return mutedNow ? muted : g_tray.iconNormal;
+    const bool manual    = g_tray.mute != ManualMute::None;
+    const bool condition = !g_tray.conditionReason.empty();
+    SlashMark mark = manual && condition ? SlashMark::Both
+                   : manual              ? SlashMark::Manual
+                   : condition           ? SlashMark::Condition
+                   :                       SlashMark::None;
+    bool dot = false;
+    if (g_tray.notice == PlayNotice::Played) {
+        mark = SlashMark::None;
+        dot = true;
+    }
+    else if (g_tray.notice == PlayNotice::Muted) {
+        if (mark == SlashMark::None) mark = SlashMark::Condition;
+        dot = true;
+    }
+    HICON icon = g_tray.overlay[static_cast<int>(mark)][dot ? 1 : 0];
+    return icon ? icon : g_tray.iconNormal;
 }
 
 // Add (NIM_ADD) or refresh (NIM_MODIFY) the tray icon to match the current state
@@ -3233,9 +3262,12 @@ static int RunTray() {
     g_tray.iconNormal = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                                       GetSystemMetrics(SM_CXSMICON),
                                                       GetSystemMetrics(SM_CYSMICON), 0));
-    g_tray.iconMuted       = CreateOverlayIcon(true, false);
-    g_tray.iconPlayed      = CreateOverlayIcon(false, true);
-    g_tray.iconMutedPlayed = CreateOverlayIcon(true, true);
+    for (int m = 0; m < SLASH_MARK_COUNT; m++) {
+        for (int d = 0; d < 2; d++) {
+            if (m == 0 && d == 0) continue;   // The plain icon is iconNormal
+            g_tray.overlay[m][d] = CreateOverlayIcon(static_cast<SlashMark>(m), d == 1);
+        }
+    }
     // A failed NIM_ADD (notification area not ready yet) is recovered by the
     // TaskbarCreated broadcast sent when the area is created
     TrayRefreshCondition();
@@ -3273,9 +3305,11 @@ static int RunTray() {
     nid.hWnd   = g_tray.hwnd;
     nid.uID    = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
-    if (g_tray.iconMutedPlayed) DestroyIcon(g_tray.iconMutedPlayed);
-    if (g_tray.iconPlayed) DestroyIcon(g_tray.iconPlayed);
-    if (g_tray.iconMuted) DestroyIcon(g_tray.iconMuted);
+    for (auto& row : g_tray.overlay) {
+        for (HICON icon : row) {
+            if (icon) DestroyIcon(icon);
+        }
+    }
     if (g_tray.iconNormal) DestroyIcon(g_tray.iconNormal);
     if (SUCCEEDED(hrCom)) CoUninitialize();
     // Closing the last handle destroys the timer, which ends any manual mute

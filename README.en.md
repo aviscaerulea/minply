@@ -116,7 +116,13 @@ Starting `minply.exe --tray` keeps minply resident in the notification area. If 
 | Startup registration | Starts the tray automatically at sign-in |
 | Open the configuration file, open the log file | Opens each file in its default app |
 
-The icon shows a red slash while a manual mute is on and while a mute condition (a microphone or camera in use, or a rule in the configuration file) is holding playback back. Hovering over the icon shows why playback is held back.
+While playback is held back, the icon shows a red slash, and its direction tells the kind of reason. Hovering over the icon shows why playback is held back.
+
+| Icon mark | Reason |
+| --- | --- |
+| Slash falling to the right (＼) | A microphone or camera in use, or a mute condition in the configuration file |
+| Slash rising to the right (／) | Manual mute |
+| X | Both |
 
 Left-clicking the icon unmutes while any manual mute is on, and otherwise mutes with no time limit.
 
