@@ -114,6 +114,8 @@ Starting `minply.exe --tray` keeps minply resident in the notification area. The
 | Startup registration | Starts the tray automatically at sign-in |
 | Open the configuration file, open the log file | Opens each file in its default app |
 
+Left-clicking the icon unmutes while any manual mute is on, and otherwise mutes with no time limit.
+
 The manual mute is released when the tray exits. The microphone/camera setting and the startup registration persist across tray restarts.
 
 ### Exit codes

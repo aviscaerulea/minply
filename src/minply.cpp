@@ -19,7 +19,8 @@
  *     the tray's manual mute
  *   - --tray stays in the notification area and offers a manual mute
  *     (indefinite or timed), the microphone/camera toggle, startup
- *     registration, and shortcuts to the config and log files
+ *     registration, and shortcuts to the config and log files; a left click
+ *     on the icon toggles the indefinite mute
  *   - Logs mute decisions, errors, config warnings and tray operations to
  *     <exe dir>\logs
  *   - --uninstall removes the registry entries and the per-user data folder
@@ -2809,6 +2810,23 @@ static void TrayMuteFor(size_t index) {
     WriteLog("manual mute: " + std::to_string(seconds) + "s until " + when);
 }
 
+// Left-click action: unmute when any manual mute is on, otherwise mute indefinitely
+//
+// A timed mute is cleared rather than turned indefinite, so the click always
+// flips what the icon shows (red slash or not). A double click delivers two
+// button-up messages and therefore toggles twice, ending where it started.
+static void TrayToggleMute() {
+    if (g_tray.mute != ManualMute::None) {
+        TrayClearMute();
+        WriteLog("manual mute cleared");
+    }
+    else {
+        TrayMuteIndefinitely();
+        WriteLog("manual mute: indefinite");
+    }
+    TrayUpdateIcon(NIM_MODIFY);
+}
+
 // Whether the Run key holds the startup entry
 static bool IsStartupRegistered() {
     return RegGetValueW(HKEY_CURRENT_USER, REG_RUN_KEY, REG_RUN_VALUE, RRF_RT_REG_SZ,
@@ -2961,6 +2979,7 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     case WM_TRAYICON:
         // Without NOTIFYICON_VERSION_4, lParam carries the mouse message itself
         if (static_cast<UINT>(lParam) == WM_RBUTTONUP) ShowTrayMenu();
+        else if (static_cast<UINT>(lParam) == WM_LBUTTONUP) TrayToggleMute();
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
