@@ -179,7 +179,7 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
 - The tray setting (`mute_durations`) is read only when the tray starts
-- The red slash for a mute condition appears up to 5 seconds after the condition starts, and disappears with the same delay
+- The red slash for a mute condition appears up to 3 seconds after the condition starts, and disappears with the same delay
 - Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
 - When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
 
