@@ -2716,8 +2716,8 @@ static HICON CreateOverlayIcon(bool slash, bool dot) {
         const float vx = bx - ax, vy = by - ay;
         const float lenSq = vx * vx + vy * vy;
 
-        // Dot geometry: about three fifths of the icon wide, inset from the bottom-right corner
-        const float dotR  = (std::max)(cx * 0.3f, 4.5f);
+        // Dot geometry: about two fifths of the icon wide, inset from the bottom-right corner
+        const float dotR  = (std::max)(cx * 0.2f, 3.0f);
         const float dotCx = cx - dotR - 0.5f, dotCy = cy - dotR - 0.5f;
 
         for (int y = 0; y < cy; y++) {
