@@ -45,18 +45,20 @@ scoop install minply
 
 #### アンインストール
 
-タスクトレイの設定は Windows のレジストリに、ログは `%LOCALAPPDATA%\minply` に残ります。すべて消す場合は、まずトレイの「スタートアップ登録」を外します。次に、以下のコマンドを実行します。
+タスクトレイの設定とスタートアップ登録は Windows のレジストリに残ります。`--uninstall` は動いているトレイを閉じ、レジストリの設定と旧版のログ（`%LOCALAPPDATA%\minply`）を削除します。minply を消す前に、次のコマンドを実行します。
 
 ```powershell
-Remove-Item -Recurse HKCU:\Software\minply
-Remove-Item -Recurse $env:LOCALAPPDATA\minply
+minply.exe --uninstall
 ```
+
+設定ファイルとログ（`logs` フォルダ）は `minply.exe` と同じフォルダにあり、このコマンドでは消えません。ZIP から入れた場合は、フォルダごと削除します。Scoop の場合は `scoop uninstall minply --purge` を実行すると、設定ファイルとログも消えます。
 
 ## 使い方
 
 ```
 minply.exe [--session <id>] [オーディオファイル | -]
 minply.exe --tray
+minply.exe --uninstall
 ```
 
 ```powershell
@@ -123,11 +125,11 @@ id に使えるのは半角英数字と `.`、`_`、`-` で、長さは 1〜64 �
 | 2 | ファイルが見つからない、読めない、空 |
 | 3 | デコード失敗 |
 | 4 | オーディオデバイスの初期化失敗 |
-| 5 | 再生失敗（常駐プロセスの起動・通信の失敗を含む） |
+| 5 | 再生失敗（常駐プロセスの起動と通信の失敗、`--uninstall` の削除失敗を含む） |
 
 ### ログ
 
-エラーと設定ファイルの警告は、標準エラー出力に加えて `%LOCALAPPDATA%\minply\logs\YYYY-MM-DD.log` にも 1 行ずつ記録し、再生の成功は記録しません。フックから呼んだときや `--session` の常駐中は標準エラー出力が見えないため、鳴らなかった原因はこのログで調べてください。
+エラーと設定ファイルの警告は、標準エラー出力に加えて `minply.exe` と同じフォルダの `logs\YYYY-MM-DD.log` にも 1 行ずつ記録し、再生の成功は記録しません。フックから呼んだときや `--session` の常駐中は標準エラー出力が見えないため、鳴らなかった原因はこのログで調べてください。
 
 ## 設定
 

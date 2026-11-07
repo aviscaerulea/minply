@@ -6,6 +6,7 @@
  * Usage:
  *   minply.exe [--session <id>] [audio file path | -]
  *   minply.exe --tray
+ *   minply.exe --uninstall
  *
  * Features:
  *   - Instantly plays MP3, WAV, AAC, FLAC, Opus and other audio files
@@ -20,7 +21,9 @@
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files
  *   - Logs mute decisions, errors, config warnings and tray operations to
- *     %LOCALAPPDATA%\minply\logs
+ *     <exe dir>\logs
+ *   - --uninstall removes the registry entries and the per-user data folder
+ *     of older versions, leaving the exe folder (config, logs) to the user
  *   - Exits immediately after playback completes
  *
  * Dependencies:
@@ -231,22 +234,30 @@ static std::wstring Utf8ToWide(const std::string& s) {
     return out;
 }
 
-// Resolve the log directory %LOCALAPPDATA%\minply\logs, creating it when absent
+// Directory of this executable with a trailing backslash; empty when it cannot be resolved
 //
-// Logs live outside the executable directory so that they survive Scoop
-// version folders being replaced on update. Returns an empty string when the
-// known folder cannot be resolved.
+// The config files and the logs folder live here (next to the exe, which
+// Scoop persists).
+static std::wstring GetExeDir() {
+    wchar_t exePath[MAX_PATH] = {};
+    DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    if (pathLen == 0 || pathLen >= MAX_PATH) return {};
+    if (!PathRemoveFileSpecW(exePath)) return {};
+    return std::wstring(exePath) + L'\\';
+}
+
+// Resolve the log directory <exe dir>\logs, creating it when absent
+//
+// Logs sit next to the exe so that no per-user folder is needed. Under Scoop
+// the exe lives in a version folder replaced on update; the manifest lists
+// "logs" in persist, so the folder is a link into the persist store and the
+// logs survive updates. Returns an empty string when the exe directory cannot
+// be resolved. An unwritable exe directory (e.g. Program Files) is not
+// detected here; WriteLog then fails silently by design.
 static std::wstring GetLogDir() {
-    PWSTR base = nullptr;
-    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &base))) {
-        CoTaskMemFree(base);
-        return {};
-    }
-    std::wstring dir = base;
-    CoTaskMemFree(base);
-    dir += L"\\minply";
-    CreateDirectoryW(dir.c_str(), nullptr);
-    dir += L"\\logs";
+    std::wstring dir = GetExeDir();
+    if (dir.empty()) return {};
+    dir += L"logs";
     CreateDirectoryW(dir.c_str(), nullptr);
     return dir;
 }
@@ -1194,17 +1205,6 @@ bool PlayAudio(const std::vector<float>& audioData, const WAVEFORMATEX* mixForma
     CloseRenderSession(session);
 
     return success;
-}
-
-// Directory of this executable with a trailing backslash; empty when it cannot be resolved
-//
-// The config files live here (next to the exe, which Scoop persists).
-static std::wstring GetExeDir() {
-    wchar_t exePath[MAX_PATH] = {};
-    DWORD pathLen = GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-    if (pathLen == 0 || pathLen >= MAX_PATH) return {};
-    if (!PathRemoveFileSpecW(exePath)) return {};
-    return std::wstring(exePath) + L'\\';
 }
 
 // Strip a trailing TOML comment from a line: cut at the first '#' outside a quoted string
@@ -2988,17 +2988,123 @@ static int RunTray() {
     return EXIT_SUCCESS;
 }
 
+// ==================== Uninstall (--uninstall) ====================
+//
+// Removes the per-user state minply creates outside its own folder: the
+// startup entry, the tray settings key, and %LOCALAPPDATA%\minply (the log
+// folder of versions before logs moved next to the exe). The exe folder
+// (exe, minply.toml, minply.local.toml, logs) is left alone: Scoop or the
+// user owns it. A running --session linger server is not stopped; it exits on
+// its own after the linger duration.
+//
+// Nothing here calls WriteLog or PrintError: an uninstall should not leave a
+// fresh log behind. Messages go to stdout (removed items) and stderr (errors).
+
+constexpr DWORD TRAY_CLOSE_TIMEOUT_MS = 5000;   // Wait for the tray to exit after WM_CLOSE
+
+// Close a running tray and wait for its process to exit
+//
+// Returns true when no tray is running or it exited within the timeout. The
+// tray must be gone before deleting: it writes the log and recreates its
+// registry values on menu operations.
+static bool CloseRunningTray() {
+    HWND hwnd = FindWindowW(TRAY_WINDOW_CLASS, nullptr);
+    if (!hwnd) return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+    if (!process) {
+        std::cerr << "Error: Failed to access the running tray" << std::endl;
+        return false;
+    }
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    const bool exited = WaitForSingleObject(process, TRAY_CLOSE_TIMEOUT_MS) == WAIT_OBJECT_0;
+    CloseHandle(process);
+    if (!exited) {
+        std::cerr << "Error: The running tray did not exit" << std::endl;
+        return false;
+    }
+    std::cout << "Closed: tray" << std::endl;
+    return true;
+}
+
+// Delete %LOCALAPPDATA%\minply recursively; true when it is gone or never existed
+//
+// The known folder is resolved without KF_FLAG_CREATE so that nothing is
+// created on the way.
+static bool DeleteLegacyDataDir() {
+    PWSTR base = nullptr;
+    HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &base);
+    std::wstring dir = SUCCEEDED(hr) ? std::wstring(base) + L"\\minply" : std::wstring();
+    CoTaskMemFree(base);
+    if (dir.empty()) {
+        std::cerr << "Error: Failed to resolve %LOCALAPPDATA%" << std::endl;
+        return false;
+    }
+    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) return true;
+
+    // SHFileOperationW takes a list terminated by an extra null character
+    std::wstring from = dir + L'\0';
+    SHFILEOPSTRUCTW op = {};
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = from.c_str();
+    op.fFlags = FOF_NO_UI;
+    if (SHFileOperationW(&op) != 0 || op.fAnyOperationsAborted) {
+        std::cerr << "Error: Failed to delete " << WideToUtf8(dir) << std::endl;
+        return false;
+    }
+    std::cout << "Removed: " << WideToUtf8(dir) << std::endl;
+    return true;
+}
+
+// Run --uninstall
+//
+// Returns EXIT_SUCCESS when every item is gone (already-absent items count as
+// success, so a second run also succeeds), ERR_PLAYBACK_FAILED otherwise.
+// When the tray cannot be closed nothing is deleted; after that every item is
+// attempted even if an earlier one fails.
+static int RunUninstall() {
+    if (!CloseRunningTray()) return ERR_PLAYBACK_FAILED;
+    bool ok = true;
+
+    LSTATUS status = RegDeleteKeyValueW(HKEY_CURRENT_USER, REG_RUN_KEY, REG_RUN_VALUE);
+    if (status == ERROR_SUCCESS) {
+        std::cout << "Removed: startup entry" << std::endl;
+    }
+    else if (status != ERROR_FILE_NOT_FOUND) {
+        std::cerr << "Error: Failed to remove the startup entry" << std::endl;
+        ok = false;
+    }
+
+    status = RegDeleteTreeW(HKEY_CURRENT_USER, REG_SETTINGS_KEY);
+    if (status == ERROR_SUCCESS) {
+        std::cout << "Removed: HKCU\\Software\\minply" << std::endl;
+    }
+    else if (status != ERROR_FILE_NOT_FOUND) {
+        std::cerr << "Error: Failed to remove HKCU\\Software\\minply" << std::endl;
+        ok = false;
+    }
+
+    if (!DeleteLegacyDataDir()) ok = false;
+    return ok ? EXIT_SUCCESS : ERR_PLAYBACK_FAILED;
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     const wchar_t* sessionId = nullptr;
     const wchar_t* serveId   = nullptr;
     const wchar_t* pathArg   = nullptr;
-    bool trayMode  = false;
-    bool argsValid = true;
+    bool trayMode      = false;
+    bool uninstallMode = false;
+    bool argsValid     = true;
 
     for (int i = 1; i < argc; i++) {
         if (wcscmp(argv[i], L"--tray") == 0) {
             if (trayMode) { argsValid = false; break; }
             trayMode = true;
+        }
+        else if (wcscmp(argv[i], L"--uninstall") == 0) {
+            if (uninstallMode) { argsValid = false; break; }
+            uninstallMode = true;
         }
         else if (wcscmp(argv[i], L"--session") == 0) {
             if (i + 1 >= argc || sessionId) { argsValid = false; break; }
@@ -3017,15 +3123,22 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
-    // --tray takes no other argument
-    if (!argsValid || (sessionId && serveId) || (trayMode && (sessionId || serveId || pathArg))) {
+    // --tray and --uninstall each take no other argument
+    const bool playArgs = sessionId || serveId || pathArg;
+    if (!argsValid || (sessionId && serveId) || (trayMode && (playArgs || uninstallMode))
+        || (uninstallMode && playArgs)) {
         PrintError("Invalid arguments");
-        std::cerr << "Usage: minply.exe [--session <id>] [audio file path | -] | minply.exe --tray" << std::endl;
+        std::cerr << "Usage: minply.exe [--session <id>] [audio file path | -] | minply.exe --tray"
+                     " | minply.exe --uninstall" << std::endl;
         return ERR_INVALID_ARGS;
     }
 
     if (trayMode) {
         return RunTray();
+    }
+
+    if (uninstallMode) {
+        return RunUninstall();
     }
 
     // Server mode is an internal entry point spawned by the client

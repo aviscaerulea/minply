@@ -45,18 +45,20 @@ scoop install minply
 
 #### Uninstalling
 
-The notification area settings stay in the Windows registry, and the logs stay in `%LOCALAPPDATA%\minply`. To remove everything, first turn off "スタートアップ登録" (startup registration) in the tray menu. Then run the following commands.
+The notification area settings and the startup registration stay in the Windows registry. `--uninstall` closes the running tray and deletes the registry settings and the logs of older versions (`%LOCALAPPDATA%\minply`). Before removing minply, run the following command.
 
 ```powershell
-Remove-Item -Recurse HKCU:\Software\minply
-Remove-Item -Recurse $env:LOCALAPPDATA\minply
+minply.exe --uninstall
 ```
+
+The configuration files and the logs (the `logs` folder) sit in the same folder as `minply.exe`, and this command leaves them in place. If you installed from the ZIP, delete the whole folder. With Scoop, `scoop uninstall minply --purge` also removes the configuration files and the logs.
 
 ## Usage
 
 ```
 minply.exe [--session <id>] [audio file | -]
 minply.exe --tray
+minply.exe --uninstall
 ```
 
 ```powershell
@@ -123,11 +125,11 @@ The manual mute is released when the tray exits. The microphone/camera setting a
 | 2 | File not found, unreadable, or empty |
 | 3 | Decoding failed |
 | 4 | Audio device initialization failed |
-| 5 | Playback failed (including failure to start or reach the resident process) |
+| 5 | Playback failed (including failure to start or reach the resident process, and a failed `--uninstall`) |
 
 ### Log
 
-Errors and configuration file warnings are written to standard error and also appended, one line each, to `%LOCALAPPDATA%\minply\logs\YYYY-MM-DD.log`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play.
+Errors and configuration file warnings are written to standard error and also appended, one line each, to `logs\YYYY-MM-DD.log` in the same folder as `minply.exe`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play.
 
 ## Configuration
 
