@@ -21,7 +21,7 @@
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
  *     on the icon toggles the indefinite mute
- *   - Each play request briefly marks the tray icon with a small green dot,
+ *   - Each play request briefly marks the tray icon with a green dot,
  *     over the red-slashed icon when the request was muted
  *   - Logs mute decisions, errors, config warnings and tray operations to
  *     <exe dir>\logs
@@ -2650,9 +2650,10 @@ static ULONGLONG NowFileTime() {
 
 // Build a variant of the normal icon with overlays
 //
-// slash: a red slash from top-left to bottom-right (muted). dot: a small
-// green dot at the bottom-right (play notice), drawn over the slash and kept
-// small so it is noticeable only when the icon is looked at.
+// slash: a red slash from top-left to bottom-right (muted). dot: a green dot
+// at the bottom-right (play notice), drawn over the slash; it is a steady
+// mark, not a blink, so it shows when the icon is looked at without drawing
+// attention otherwise.
 // Pixels are written straight (non-premultiplied) into a 32bpp DIB so the
 // overlays get an explicit alpha; GDI drawing calls would leave alpha at 0 and
 // the shell would render them transparent. Coverage comes from the distance
@@ -2715,8 +2716,8 @@ static HICON CreateOverlayIcon(bool slash, bool dot) {
         const float vx = bx - ax, vy = by - ay;
         const float lenSq = vx * vx + vy * vy;
 
-        // Dot geometry: about a fifth of the icon wide, inset from the bottom-right corner
-        const float dotR  = (std::max)(cx / 10.0f, 1.5f);
+        // Dot geometry: about three fifths of the icon wide, inset from the bottom-right corner
+        const float dotR  = (std::max)(cx * 0.3f, 4.5f);
         const float dotCx = cx - dotR - 0.5f, dotCy = cy - dotR - 0.5f;
 
         for (int y = 0; y < cy; y++) {
