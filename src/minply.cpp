@@ -21,7 +21,8 @@
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
  *     on the icon toggles the indefinite mute; shows the red slash while a
- *     condition mute holds too, with the reason in the tooltip
+ *     condition mute holds too, with the reason in the tooltip; a second
+ *     --tray replaces the running tray
  *   - Each play request briefly marks the tray icon with a green dot,
  *     over the red-slashed icon when the request was muted
  *   - Logs mute decisions, errors, config warnings and tray operations to
@@ -3136,23 +3137,62 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+constexpr DWORD TRAY_CLOSE_TIMEOUT_MS = 5000;   // Wait for the tray to exit after WM_CLOSE
+
+// Close a running tray and wait for its process to exit
+//
+// Returns true when no tray window exists or its process exited within the
+// timeout. Used by --tray to replace an older tray and by --uninstall, which
+// needs the tray gone before deleting: it writes the log and recreates its
+// registry values on menu operations. Reports to stdout and stderr only (no
+// WriteLog), so that --uninstall leaves no fresh log behind.
+static bool CloseRunningTray() {
+    HWND hwnd = FindWindowW(TRAY_WINDOW_CLASS, nullptr);
+    if (!hwnd) return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    HANDLE process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
+    if (!process) {
+        std::cerr << "Error: Failed to access the running tray" << std::endl;
+        return false;
+    }
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+    const bool exited = WaitForSingleObject(process, TRAY_CLOSE_TIMEOUT_MS) == WAIT_OBJECT_0;
+    CloseHandle(process);
+    if (!exited) {
+        std::cerr << "Error: The running tray did not exit" << std::endl;
+        return false;
+    }
+    std::cout << "Closed: tray" << std::endl;
+    return true;
+}
+
 // Run the tray: create the manual mute timer, prune old logs, show the icon, pump messages
 //
-// A second tray finds the timer already present and exits 0 at once (the
-// first one keeps running). The window is a hidden top-level window, not a
-// message-only one, because TaskbarCreated is broadcast only to top-level
-// windows. Returns EXIT_SUCCESS on exit, ERR_PLAYBACK_FAILED when the timer
-// or window cannot be created.
+// A tray started while another one runs (the timer already exists) closes the
+// older tray and takes its place; the older tray's manual mute is discarded.
+// After the close the timer is created again; it may still exist if a player
+// holds a handle at that moment, and the new tray then adopts it and clears
+// the mute. Two trays started at the same instant may both stay resident,
+// because the later one cannot find the earlier one's window before it is
+// created. The window is a hidden top-level window, not a message-only one,
+// because TaskbarCreated is broadcast only to top-level windows. Returns
+// EXIT_SUCCESS on exit, ERR_PLAYBACK_FAILED when the older tray does not
+// exit or the timer or window cannot be created.
 static int RunTray() {
     HANDLE timer = CreateWaitableTimerW(nullptr, TRUE, MANUAL_MUTE_TIMER_NAME);
+    if (timer && GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(timer);
+        if (!CloseRunningTray()) {
+            PrintError("Failed to close the running tray");
+            return ERR_PLAYBACK_FAILED;
+        }
+        WriteLog("tray replaced the running tray");
+        timer = CreateWaitableTimerW(nullptr, TRUE, MANUAL_MUTE_TIMER_NAME);
+    }
     if (!timer) {
         PrintError("Failed to create manual mute timer");
         return ERR_PLAYBACK_FAILED;
-    }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(timer);
-        WriteLog("tray already running");
-        return EXIT_SUCCESS;
     }
     g_tray.timer = timer;
     TrayClearMute();   // A new timer starts non-signaled, i.e. muted
@@ -3244,34 +3284,6 @@ static int RunTray() {
 //
 // Nothing here calls WriteLog or PrintError: an uninstall should not leave a
 // fresh log behind. Messages go to stdout (removed items) and stderr (errors).
-
-constexpr DWORD TRAY_CLOSE_TIMEOUT_MS = 5000;   // Wait for the tray to exit after WM_CLOSE
-
-// Close a running tray and wait for its process to exit
-//
-// Returns true when no tray is running or it exited within the timeout. The
-// tray must be gone before deleting: it writes the log and recreates its
-// registry values on menu operations.
-static bool CloseRunningTray() {
-    HWND hwnd = FindWindowW(TRAY_WINDOW_CLASS, nullptr);
-    if (!hwnd) return true;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
-    HANDLE process = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : nullptr;
-    if (!process) {
-        std::cerr << "Error: Failed to access the running tray" << std::endl;
-        return false;
-    }
-    PostMessageW(hwnd, WM_CLOSE, 0, 0);
-    const bool exited = WaitForSingleObject(process, TRAY_CLOSE_TIMEOUT_MS) == WAIT_OBJECT_0;
-    CloseHandle(process);
-    if (!exited) {
-        std::cerr << "Error: The running tray did not exit" << std::endl;
-        return false;
-    }
-    std::cout << "Closed: tray" << std::endl;
-    return true;
-}
 
 // Delete %LOCALAPPDATA%\minply recursively; true when it is gone or never existed
 //

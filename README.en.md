@@ -105,7 +105,7 @@ An id may contain alphanumeric characters plus `.`, `_` and `-`, and must be 1 t
 
 ### Notification area
 
-Starting `minply.exe --tray` keeps minply resident in the notification area. The icon's right-click menu (in Japanese) offers the following.
+Starting `minply.exe --tray` keeps minply resident in the notification area. If a tray is already running, it is closed and replaced by the new one. The icon's right-click menu (in Japanese) offers the following.
 
 | Operation | Description |
 | --- | --- |
@@ -131,7 +131,7 @@ The manual mute is released when the tray exits. The microphone/camera setting a
 | 2 | File not found, unreadable, or empty |
 | 3 | Decoding failed |
 | 4 | Audio device initialization failed |
-| 5 | Playback failed (including failure to start or reach the resident process, and a failed `--uninstall`) |
+| 5 | Playback failed (including failure to start or reach the resident process, failure to start the tray, and a failed `--uninstall`) |
 
 ### Log
 
