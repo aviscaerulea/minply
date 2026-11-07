@@ -116,6 +116,8 @@ Starting `minply.exe --tray` keeps minply resident in the notification area. The
 
 Left-clicking the icon unmutes while any manual mute is on, and otherwise mutes with no time limit.
 
+When a playback request arrives, a small green dot appears at the bottom-right of the icon for 3 seconds, even when the request is not played because of a mute.
+
 The manual mute is released when the tray exits. The microphone/camera setting and the startup registration persist across tray restarts.
 
 ### Exit codes

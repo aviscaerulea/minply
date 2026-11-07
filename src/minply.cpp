@@ -21,6 +21,8 @@
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
  *     on the icon toggles the indefinite mute
+ *   - Each play request briefly marks the tray icon with a small green dot,
+ *     over the red-slashed icon when the request was muted
  *   - Logs mute decisions, errors, config warnings and tray operations to
  *     <exe dir>\logs
  *   - --uninstall removes the registry entries and the per-user data folder
@@ -2586,6 +2588,9 @@ static int RunClient(const wchar_t* sessionId, const std::vector<BYTE>& inputDat
 // manual mute is forgotten by design.
 
 constexpr UINT    WM_TRAYICON            = WM_APP + 1;   // Shell_NotifyIcon callback message
+constexpr UINT    WM_PLAY_NOTICE         = WM_APP + 2;   // Posted by players per request; wParam non-zero = muted
+constexpr UINT_PTR PLAY_NOTICE_TIMER_ID  = 1;            // SetTimer id that ends the play notice
+constexpr UINT    PLAY_NOTICE_MS         = 3000;         // How long the play notice dot stays on the icon
 constexpr wchar_t TRAY_WINDOW_CLASS[]    = L"minply_tray";      // Window class of the hidden tray window
 constexpr wchar_t GITHUB_URL[]           = L"https://github.com/aviscaerulea/minply";  // Opened by the version menu entry
 constexpr wchar_t REG_RUN_KEY[]          = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";  // HKCU startup programs
@@ -2605,14 +2610,20 @@ constexpr UINT IDM_MUTE_DURATION_BASE = 1100;
 
 enum class ManualMute { None, Timed, Indefinite };
 
+// Play notice shown for PLAY_NOTICE_MS after the latest play request
+enum class PlayNotice { None, Played, Muted };
+
 // Process-wide tray state; the tray runs a single UI thread, so no locking
 struct TrayState {
     HWND       hwnd             = nullptr;
     HANDLE     timer            = nullptr;   // Manual mute timer (see MANUAL_MUTE_TIMER_NAME)
     HICON      iconNormal       = nullptr;
     HICON      iconMuted        = nullptr;   // Normal icon with a red slash; falls back to iconNormal
+    HICON      iconPlayed       = nullptr;   // Normal icon with the notice dot; falls back to the base icon
+    HICON      iconMutedPlayed  = nullptr;   // Red-slashed icon with the notice dot; same fallback
     UINT       taskbarCreated   = 0;         // Registered "TaskbarCreated" message
     ManualMute mute             = ManualMute::None;
+    PlayNotice notice           = PlayNotice::None;
     ULONGLONG  muteUntil        = 0;         // UTC FILETIME of the timed mute's expiry
     size_t     muteIndex        = 0;         // Menu entry chosen for the timed mute
     std::vector<MuteDuration> durations;
@@ -2637,15 +2648,18 @@ static ULONGLONG NowFileTime() {
     return (static_cast<ULONGLONG>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
 }
 
-// Build the muted icon: the normal icon with a red slash from top-left to bottom-right
+// Build a variant of the normal icon with overlays
 //
+// slash: a red slash from top-left to bottom-right (muted). dot: a small
+// green dot at the bottom-right (play notice), drawn over the slash and kept
+// small so it is noticeable only when the icon is looked at.
 // Pixels are written straight (non-premultiplied) into a 32bpp DIB so the
-// slash gets an explicit alpha; GDI drawing calls would leave alpha at 0 and
-// the shell would render the stroke transparent. Coverage comes from the
-// distance to the line segment, which antialiases the edges. Ported from
-// gcalntfy's badge drawing. Returns nullptr on any GDI failure; the caller
-// then keeps showing the normal icon.
-static HICON CreateMutedIcon() {
+// overlays get an explicit alpha; GDI drawing calls would leave alpha at 0 and
+// the shell would render them transparent. Coverage comes from the distance
+// to the shape, which antialiases the edges. Ported from gcalntfy's badge
+// drawing. Returns nullptr on any GDI failure; the caller then falls back to
+// an icon without the overlays.
+static HICON CreateOverlayIcon(bool slash, bool dot) {
     const int cx = GetSystemMetrics(SM_CXSMICON);
     const int cy = GetSystemMetrics(SM_CYSMICON);
 
@@ -2677,37 +2691,51 @@ static HICON CreateMutedIcon() {
         DrawIconEx(mem, 0, 0, base, cx, cy, 0, nullptr, DI_NORMAL);   // Writes alpha into a 32bpp DIB
         SelectObject(mem, oldColor);
 
+        // Source-over of a color with the given coverage onto one pixel (straight alpha)
+        auto blend = [&](int x, int y, float alpha, float sr, float sg, float sb) {
+            if (alpha <= 0.0f) return;
+            const UINT32 dst = pixels[y * cx + x];
+            const float da = ((dst >> 24) & 0xFFu) / 255.0f;
+            const float dr = ((dst >> 16) & 0xFFu) / 255.0f;
+            const float dg = ((dst >> 8)  & 0xFFu) / 255.0f;
+            const float db = ( dst        & 0xFFu) / 255.0f;
+            const float oa = alpha + da * (1.0f - alpha);
+            const float inv = (1.0f - alpha) * da;
+            const UINT32 R = static_cast<UINT32>((sr * alpha + dr * inv) / oa * 255.0f + 0.5f);
+            const UINT32 G = static_cast<UINT32>((sg * alpha + dg * inv) / oa * 255.0f + 0.5f);
+            const UINT32 B = static_cast<UINT32>((sb * alpha + db * inv) / oa * 255.0f + 0.5f);
+            const UINT32 A = static_cast<UINT32>(oa * 255.0f + 0.5f);
+            pixels[y * cx + x] = (A << 24) | (R << 16) | (G << 8) | B;
+        };
+
         // Slash geometry, in pixel-center coordinates
         const float ax = 0.15f * cx, ay = 0.15f * cy;
         const float bx = 0.85f * cx, by = 0.85f * cy;
         const float halfWidth = (std::max)(cx / 8.0f, 2.0f) / 2.0f;
         const float vx = bx - ax, vy = by - ay;
         const float lenSq = vx * vx + vy * vy;
-        const float sr = 230.0f / 255.0f, sg = 40.0f / 255.0f, sb = 40.0f / 255.0f;
+
+        // Dot geometry: about a fifth of the icon wide, inset from the bottom-right corner
+        const float dotR  = (std::max)(cx / 10.0f, 1.5f);
+        const float dotCx = cx - dotR - 0.5f, dotCy = cy - dotR - 0.5f;
 
         for (int y = 0; y < cy; y++) {
             for (int x = 0; x < cx; x++) {
                 const float px = x + 0.5f, py = y + 0.5f;
-                float t = ((px - ax) * vx + (py - ay) * vy) / lenSq;
-                t = (std::min)((std::max)(t, 0.0f), 1.0f);
-                const float dx = px - (ax + t * vx), dy = py - (ay + t * vy);
-                const float d = sqrtf(dx * dx + dy * dy);
-                const float alpha = (std::min)((std::max)(halfWidth + 0.5f - d, 0.0f), 1.0f);
-                if (alpha <= 0.0f) continue;
-
-                // Source-over onto the icon pixel (straight alpha)
-                const UINT32 dst = pixels[y * cx + x];
-                const float da = ((dst >> 24) & 0xFFu) / 255.0f;
-                const float dr = ((dst >> 16) & 0xFFu) / 255.0f;
-                const float dg = ((dst >> 8)  & 0xFFu) / 255.0f;
-                const float db = ( dst        & 0xFFu) / 255.0f;
-                const float oa = alpha + da * (1.0f - alpha);
-                const float inv = (1.0f - alpha) * da;
-                const UINT32 R = static_cast<UINT32>((sr * alpha + dr * inv) / oa * 255.0f + 0.5f);
-                const UINT32 G = static_cast<UINT32>((sg * alpha + dg * inv) / oa * 255.0f + 0.5f);
-                const UINT32 B = static_cast<UINT32>((sb * alpha + db * inv) / oa * 255.0f + 0.5f);
-                const UINT32 A = static_cast<UINT32>(oa * 255.0f + 0.5f);
-                pixels[y * cx + x] = (A << 24) | (R << 16) | (G << 8) | B;
+                if (slash) {
+                    float t = ((px - ax) * vx + (py - ay) * vy) / lenSq;
+                    t = (std::min)((std::max)(t, 0.0f), 1.0f);
+                    const float dx = px - (ax + t * vx), dy = py - (ay + t * vy);
+                    const float d = sqrtf(dx * dx + dy * dy);
+                    blend(x, y, (std::min)((std::max)(halfWidth + 0.5f - d, 0.0f), 1.0f),
+                          230.0f / 255.0f, 40.0f / 255.0f, 40.0f / 255.0f);
+                }
+                if (dot) {
+                    const float dx = px - dotCx, dy = py - dotCy;
+                    const float d = sqrtf(dx * dx + dy * dy);
+                    blend(x, y, (std::min)((std::max)(dotR + 0.5f - d, 0.0f), 1.0f),
+                          40.0f / 255.0f, 190.0f / 255.0f, 70.0f / 255.0f);
+                }
             }
         }
 
@@ -2748,7 +2776,20 @@ static std::wstring TrayTooltip() {
     return buf;
 }
 
-// Add (NIM_ADD) or refresh (NIM_MODIFY) the tray icon to match the manual mute state
+// Icon for the current state: a play notice wins over the manual mute state
+//
+// A missing overlay icon (GDI failure at startup) falls back to the icon
+// without that overlay.
+static HICON TrayCurrentIcon() {
+    HICON muted = g_tray.iconMuted ? g_tray.iconMuted : g_tray.iconNormal;
+    if (g_tray.notice == PlayNotice::Muted)
+        return g_tray.iconMutedPlayed ? g_tray.iconMutedPlayed : muted;
+    if (g_tray.notice == PlayNotice::Played)
+        return g_tray.iconPlayed ? g_tray.iconPlayed : g_tray.iconNormal;
+    return g_tray.mute != ManualMute::None ? muted : g_tray.iconNormal;
+}
+
+// Add (NIM_ADD) or refresh (NIM_MODIFY) the tray icon to match the current state
 //
 // NIM_ADD is also the recovery path after Explorer restarts (TaskbarCreated).
 // NOTIFYICON_VERSION_4 is deliberately not used: it suppresses the standard
@@ -2760,9 +2801,25 @@ static void TrayUpdateIcon(DWORD message) {
     nid.uID              = 1;
     nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon            = (g_tray.mute != ManualMute::None && g_tray.iconMuted) ? g_tray.iconMuted : g_tray.iconNormal;
+    nid.hIcon            = TrayCurrentIcon();
     wcsncpy_s(nid.szTip, TrayTooltip().c_str(), _TRUNCATE);
     Shell_NotifyIconW(message, &nid);
+}
+
+// End the play notice; the caller refreshes the icon
+static void TrayEndPlayNotice() {
+    KillTimer(g_tray.hwnd, PLAY_NOTICE_TIMER_ID);
+    g_tray.notice = PlayNotice::None;
+}
+
+// Tell a running tray that a play request arrived (player side)
+//
+// Posted, never sent, so a hung tray cannot delay playback; with no tray
+// running this does nothing. Called once per invocation right after the mute
+// decision, so --session requests are covered by their client process.
+static void NotifyTrayOfPlayRequest(bool muted) {
+    HWND hwnd = FindWindowW(TRAY_WINDOW_CLASS, nullptr);
+    if (hwnd) PostMessageW(hwnd, WM_PLAY_NOTICE, muted ? 1 : 0, 0);
 }
 
 // Signal the timer at once: players see "not muted"
@@ -2977,9 +3034,29 @@ static LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM l
     }
     switch (msg) {
     case WM_TRAYICON:
-        // Without NOTIFYICON_VERSION_4, lParam carries the mouse message itself
-        if (static_cast<UINT>(lParam) == WM_RBUTTONUP) ShowTrayMenu();
-        else if (static_cast<UINT>(lParam) == WM_LBUTTONUP) TrayToggleMute();
+        // Without NOTIFYICON_VERSION_4, lParam carries the mouse message itself.
+        // A click ends any play notice first, so once the click is handled
+        // the icon shows the real manual mute state.
+        if (static_cast<UINT>(lParam) == WM_RBUTTONUP) {
+            TrayEndPlayNotice();
+            ShowTrayMenu();
+        }
+        else if (static_cast<UINT>(lParam) == WM_LBUTTONUP) {
+            TrayEndPlayNotice();
+            TrayToggleMute();
+        }
+        return 0;
+    case WM_PLAY_NOTICE:
+        // A request during a notice replaces it and restarts the countdown
+        g_tray.notice = wParam ? PlayNotice::Muted : PlayNotice::Played;
+        SetTimer(hwnd, PLAY_NOTICE_TIMER_ID, PLAY_NOTICE_MS, nullptr);
+        TrayUpdateIcon(NIM_MODIFY);
+        return 0;
+    case WM_TIMER:
+        if (wParam == PLAY_NOTICE_TIMER_ID) {
+            TrayEndPlayNotice();
+            TrayUpdateIcon(NIM_MODIFY);
+        }
         return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -3035,7 +3112,9 @@ static int RunTray() {
     g_tray.iconNormal = static_cast<HICON>(LoadImageW(instance, MAKEINTRESOURCEW(1), IMAGE_ICON,
                                                       GetSystemMetrics(SM_CXSMICON),
                                                       GetSystemMetrics(SM_CYSMICON), 0));
-    g_tray.iconMuted = CreateMutedIcon();
+    g_tray.iconMuted       = CreateOverlayIcon(true, false);
+    g_tray.iconPlayed      = CreateOverlayIcon(false, true);
+    g_tray.iconMutedPlayed = CreateOverlayIcon(true, true);
     // A failed NIM_ADD (notification area not ready yet) is recovered by the
     // TaskbarCreated broadcast sent when the area is created
     TrayUpdateIcon(NIM_ADD);
@@ -3069,6 +3148,8 @@ static int RunTray() {
     nid.hWnd   = g_tray.hwnd;
     nid.uID    = 1;
     Shell_NotifyIconW(NIM_DELETE, &nid);
+    if (g_tray.iconMutedPlayed) DestroyIcon(g_tray.iconMutedPlayed);
+    if (g_tray.iconPlayed) DestroyIcon(g_tray.iconPlayed);
     if (g_tray.iconMuted) DestroyIcon(g_tray.iconMuted);
     if (g_tray.iconNormal) DestroyIcon(g_tray.iconNormal);
     if (SUCCEEDED(hrCom)) CoUninitialize();
@@ -3253,6 +3334,7 @@ int wmain(int argc, wchar_t* argv[]) {
     // break the writer's pipe, and a hook piping audio in would then see its
     // writer fail only while muted.
     std::string muteReason = FindMuteReason(config);
+    NotifyTrayOfPlayRequest(!muteReason.empty());
     if (!muteReason.empty()) {
         bool fromStdin = !pathArg || wcscmp(pathArg, L"-") == 0;
         if (fromStdin) {
