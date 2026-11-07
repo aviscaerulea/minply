@@ -141,6 +141,12 @@ constexpr size_t SESSION_ID_MAX           = 64;      // Session id length cap (k
 // Log retention ([log] retention_days): days of daily logs kept, today included; 0 keeps all
 constexpr int    LOG_RETENTION_DAYS       = 7;
 constexpr int    LOG_RETENTION_DAYS_MAX   = 3650;
+
+// Tray condition-mute poll ([tray] condition_interval): seconds between re-evaluations for the icon.
+// Below 1 s the extra polls cost CPU without a visible benefit; above 60 s the icon lags too far behind.
+constexpr float  CONDITION_INTERVAL       = 5.0f;
+constexpr float  CONDITION_INTERVAL_MIN   = 1.0f;
+constexpr float  CONDITION_INTERVAL_MAX   = 60.0f;
 constexpr uint64_t PIPE_MAX_DATA          = 256ULL * 1024 * 1024;  // Request payload cap; far above any notification sound, keeps a hostile client from forcing huge allocations
 constexpr DWORD  CLIENT_RESPONSE_TIMEOUT_MS = 600000;  // Client-side cap on waiting for its own playback result (covers long audio)
 constexpr DWORD  SERVER_PLAY_MARGIN_MS    = 30000;   // Extra wait margin for the render thread to finish one audio
@@ -219,6 +225,7 @@ struct AppConfig {
     float loudnessPeakCeiling = LOUDNESS_PEAK_CEILING;
     float lingerDuration      = LINGER_DURATION;
     int   logRetentionDays    = LOG_RETENTION_DAYS;
+    float conditionInterval   = CONDITION_INTERVAL;
     std::vector<std::wstring>   muteProcesses;
     std::vector<MuteWindowRule> muteWindows;
     std::vector<MuteDuration>   muteDurations = DefaultMuteDurations();
@@ -1575,7 +1582,10 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             }
         }
         else if (section == "tray") {
-            if (key == "mute_durations") {
+            if (key == "condition_interval") {
+                parseFloat(config.conditionInterval, CONDITION_INTERVAL_MIN, CONDITION_INTERVAL_MAX);
+            }
+            else if (key == "mute_durations") {
                 std::vector<std::string> items;
                 if (!ParseTomlStringArray(val, items)) {
                     warnInvalid();
@@ -2598,7 +2608,7 @@ static int RunClient(const wchar_t* sessionId, const std::vector<BYTE>& inputDat
 // The tray only owns the manual mute (the waitable timer named by
 // MANUAL_MUTE_TIMER_NAME) and the menu-toggled settings in the registry.
 // Condition mutes are evaluated by each player itself, so they work without
-// the tray. The tray re-evaluates them every CONDITION_POLL_MS only to show
+// the tray. The tray re-evaluates them every [tray] condition_interval only to show
 // them; players never ask the tray. Across tray restarts the registry settings persist, while the
 // manual mute is forgotten by design.
 
@@ -2607,7 +2617,6 @@ constexpr UINT    WM_PLAY_NOTICE         = WM_APP + 2;   // Posted by players pe
 constexpr UINT_PTR PLAY_NOTICE_TIMER_ID  = 1;            // SetTimer id that ends the play notice
 constexpr UINT    PLAY_NOTICE_MS         = 3000;         // How long the play notice dot stays on the icon
 constexpr UINT_PTR CONDITION_TIMER_ID    = 2;            // SetTimer id of the condition-mute poll
-constexpr UINT     CONDITION_POLL_MS     = 3000;         // Interval of the condition-mute poll
 constexpr wchar_t TRAY_WINDOW_CLASS[]    = L"minply_tray";      // Window class of the hidden tray window
 constexpr wchar_t GITHUB_URL[]           = L"https://github.com/aviscaerulea/minply";  // Opened by the version menu entry
 constexpr wchar_t REG_RUN_KEY[]          = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";  // HKCU startup programs
@@ -2858,8 +2867,8 @@ static void ConfigFileStamp(ULONGLONG stamp[2]) {
 //
 // Mirrors the player's FindMuteReason minus the manual mute, which the tray
 // holds itself. The config is reloaded first when either file changed, so
-// the icon follows the same rules a player would read; mute_durations are
-// deliberately left as loaded at startup. IsMeetingActive's MTA
+// the icon follows the same rules a player would read; mute_durations and
+// condition_interval are deliberately left as loaded at startup. IsMeetingActive's MTA
 // initialization fails on this STA thread and the check then runs on the
 // tray's own COM apartment.
 static bool TrayRefreshCondition() {
@@ -3231,7 +3240,9 @@ static int RunTray() {
     // TaskbarCreated broadcast sent when the area is created
     TrayRefreshCondition();
     TrayUpdateIcon(NIM_ADD);
-    SetTimer(g_tray.hwnd, CONDITION_TIMER_ID, CONDITION_POLL_MS, nullptr);
+    // The interval is fixed here like mute_durations; later config reloads only refresh the rules
+    SetTimer(g_tray.hwnd, CONDITION_TIMER_ID,
+             static_cast<UINT>(g_tray.config.conditionInterval * 1000.0f), nullptr);
     WriteLog("tray started");
 
     // Wait on the timer only while a timed mute runs: the timer is manual-reset,

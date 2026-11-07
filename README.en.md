@@ -167,6 +167,7 @@ The main items are as follows.
 | `log` | `retention_days` | Days of logs kept when the tray starts (0 keeps all) |
 | `mute` | `processes` | Apps (exe names) that suppress playback while running |
 | `mute.window` | `process`, `title` | Suppress playback when a window title of the app matches the regular expression |
+| `tray` | `condition_interval` | How often the mute conditions are checked and reflected on the icon (seconds) |
 | `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
 
 Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log.
@@ -178,8 +179,8 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
-- The tray setting (`mute_durations`) is read only when the tray starts
-- The red slash for a mute condition appears up to 3 seconds after the condition starts, and disappears with the same delay
+- The tray settings (`condition_interval`, `mute_durations`) are read only when the tray starts
+- The red slash for a mute condition reaches the icon up to `condition_interval` (5 seconds by default) late, both when the condition starts and when it ends
 - Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
 - When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
 
