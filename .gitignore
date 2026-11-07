@@ -19,3 +19,5 @@ test.bat
 
 # Local config
 *.local.*
+# Template of the user config bundled in the release ZIP
+!/package/minply.local.toml

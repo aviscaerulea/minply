@@ -32,7 +32,9 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 
 #### From the release ZIP
 
-Download `minply-<version>-x64.zip` from the [releases page](https://github.com/aviscaerulea/minply/releases/latest). Extract it and place `minply.exe` in any folder you like. Placing the bundled `minply.toml` in the same folder lets you adjust the behavior.
+Download `minply-<version>-x64.zip` from the [releases page](https://github.com/aviscaerulea/minply/releases/latest). Extract it and place `minply.exe` in any folder you like. Placing the bundled `minply.toml` and `minply.local.toml` in the same folder lets you adjust the behavior (see [Configuration](#configuration)).
+
+When updating to a new version, replace only `minply.exe` and `minply.toml`. Overwriting `minply.local.toml` as well erases the settings you wrote.
 
 #### From Scoop
 
@@ -139,9 +141,20 @@ Errors and configuration file warnings are written to standard error and also ap
 
 ## Configuration
 
-Placing `minply.toml` in the same folder as the executable lets you adjust the behavior. Without it, minply runs with the default values. If you also place `minply.local.toml`, it is loaded afterwards and overrides the settings. Use it for settings specific to your own environment.
+Write your settings in `minply.local.toml` in the same folder as the executable. Without the file, or for items you do not write, minply runs with the default values.
 
-The meaning and default value of each item are documented in the comments inside `minply.toml`. The main items are as follows.
+`minply.toml` is the reference for every setting and its default value, and its comments explain what each item means and how to write it. Each update replaces it with the new version, so do not edit it directly. minply reads `minply.toml` first and then `minply.local.toml`, and the values in the latter take precedence. With Scoop, `minply.local.toml` is carried over across updates.
+
+```toml
+# Example minply.local.toml: lower the volume and stay silent while Zoom is running
+[loudness]
+target = -20.0
+
+[mute]
+processes = ["Zoom.exe"]
+```
+
+The main items are as follows.
 
 | Section | Item | Description |
 | --- | --- | --- |

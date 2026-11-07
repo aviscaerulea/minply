@@ -40,11 +40,11 @@ tasks:
       - pwsh -ExecutionPolicy Bypass -File build.ps1 -Version {{.VERSION}}
 
   release:
-    desc: リリースビルドを行い zip に圧縮する（exe + toml 同梱）
+    desc: リリースビルドを行い zip に圧縮する（exe + toml + local.toml 同梱）
     deps: [clean]
     cmds:
       - task: build
-      - pwsh -Command "Compress-Archive -Path {{.OUT_DIR}}/minply.exe, minply.toml -DestinationPath minply-{{trimPrefix "v" .VERSION}}-x64.zip -Force"
+      - pwsh -Command "Compress-Archive -Path {{.OUT_DIR}}/minply.exe, minply.toml, package/minply.local.toml -DestinationPath minply-{{trimPrefix "v" .VERSION}}-x64.zip -Force"
 
   run:
     desc: test.mp3 を再生

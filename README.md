@@ -32,7 +32,9 @@ Bluetooth レシーバは無音が続くと省電力状態に入り、次に鳴�
 
 #### リリースの ZIP から
 
-[リリースページ](https://github.com/aviscaerulea/minply/releases/latest)から `minply-<バージョン>-x64.zip` をダウンロードします。展開して出てくる `minply.exe` を任意のフォルダへ置けば使えます。同梱の `minply.toml` を同じフォルダへ置くと動作を調整できます。
+[リリースページ](https://github.com/aviscaerulea/minply/releases/latest)から `minply-<バージョン>-x64.zip` をダウンロードします。展開して出てくる `minply.exe` を任意のフォルダへ置けば使えます。同梱の `minply.toml` と `minply.local.toml` も同じフォルダへ置くと、動作を調整できます（[設定](#設定)）。
+
+新しい版へ更新するときは、`minply.exe` と `minply.toml` だけを置き換えます。`minply.local.toml` まで上書きすると、自分で書いた設定が消えます。
 
 #### Scoop から
 
@@ -139,9 +141,20 @@ id に使えるのは半角英数字と `.`、`_`、`-` で、長さは 1〜64 �
 
 ## 設定
 
-実行ファイルと同じフォルダに `minply.toml` を置くと動作を調整できます。無い場合は既定値で動きます。`minply.local.toml` を併せて置くと、その内容が後から設定を上書きします。個人環境だけの設定に使ってください。
+設定は、実行ファイルと同じフォルダの `minply.local.toml` に書きます。ファイルが無い場合や項目を書いていない場合は、既定値で動きます。
 
-各項目の意味と既定値は `minply.toml` のコメントに書いてあります。主な項目は次のとおりです。
+`minply.toml` は全設定項目と既定値のリファレンスで、各項目の意味と書き方をコメントで説明しています。更新のたびに新しい版に置き換わるので、直接書き換えないでください。minply は `minply.toml` を読んだ後に `minply.local.toml` を読み、後者に書いた値を優先します。Scoop で入れた場合は、更新しても `minply.local.toml` がそのまま残ります。
+
+```toml
+# minply.local.toml の例：音量を下げ、Zoom の起動中は鳴らさない
+[loudness]
+target = -20.0
+
+[mute]
+processes = ["Zoom.exe"]
+```
+
+主な項目は次のとおりです。
 
 | セクション | 項目 | 内容 |
 | --- | --- | --- |

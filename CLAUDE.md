@@ -29,7 +29,7 @@
 
 ### リリース手順
 
-- アセット命名: `minply-{version}-x64.zip`（exe + toml 同梱）
+- アセット命名: `minply-{version}-x64.zip`（exe + toml + `package/minply.local.toml` 同梱）
 - バージョニング: 機能追加は minor、バグ修正は patch
 
 ### コーディング規則
