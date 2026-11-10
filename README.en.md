@@ -18,7 +18,7 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 - Standard input playback: audio data can be piped in instead of passing a file path
 - Single executable: no installation required, just drop it in place
 - Immediate exit: plays without showing a window and exits as soon as it finishes
-- Mute conditions: detects a specified app running, a specific site open in the browser, or a microphone or camera in use, and skips playback
+- Mute conditions: detects a specified app running or playing sound, a specific site open in the browser, or a microphone or camera in use, and skips playback
 - Manual mute: silences playback from the notification area menu, for a set time or with no time limit
 
 ## Installation
@@ -152,12 +152,16 @@ Write your settings in `minply.local.toml` in the same folder as the executable.
 `minply.toml` is the reference for every setting and its default value, and its comments explain what each item means and how to write it. Each update replaces it with the new version, so do not edit it directly. minply reads `minply.toml` first and then `minply.local.toml`, and the values in the latter take precedence. With Scoop, `minply.local.toml` is carried over across updates.
 
 ```toml
-# Example minply.local.toml: lower the volume and stay silent while Zoom is running
+# Example minply.local.toml: lower the volume, and stay silent while Zoom is running or Spotify is playing
 [loudness]
 target = -20.0
 
-[mute]
-processes = ["Zoom.exe"]
+[[mute]]
+process = "Zoom.exe"
+
+[[mute]]
+process = "Spotify.exe"
+playing = true
 ```
 
 The main items are as follows.
@@ -171,12 +175,11 @@ The main items are as follows.
 | `loudness` | `target` | The loudness to normalize to |
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
 | `log` | `retention_days` | Days of logs kept when the tray starts (0 keeps all) |
-| `mute` | `processes` | Apps (exe names) that suppress playback while running |
-| `mute.window` | `process`, `title` | Suppress playback when a window title of the app matches the regular expression |
+| `mute` (repeat `[[mute]]`) | `process`, `title`, `playing` | Suppress playback while the app is running, while its window title matches the regular expression, or while it is playing sound (a rule holds when all the conditions written in it hold) |
 | `tray` | `condition_interval` | How often the mute conditions are checked and reflected on the icon (seconds) |
 | `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
 
-Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log.
+Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log. A `[[mute]]` entry that has an invalid value or no `process`, however, is ignored as a whole with a warning.
 
 ## Limitations
 
@@ -185,10 +188,13 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
+- The playing-sound condition reads the volume at that moment, so it does not hold while the app is paused or silent between tracks
+- The playing-sound condition is judged per app, so in a browser it cannot tell which tab is playing the sound
 - The tray settings (`condition_interval`, `mute_durations`) are read only when the tray starts
 - The red slash for a mute condition reaches the icon up to `condition_interval` (5 seconds by default) late, both when the condition starts and when it ends
 - Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
 - When a mute condition holds, minply exits with code 0 without playing, even if the file does not exist, and records the reason in the log
+- `v2.0.0` changed the configuration format: `[mute] processes` and `[[mute.window]]` are no longer read (rewrite them as `[[mute]]`)
 
 ## Build
 

@@ -16,5 +16,5 @@
 # [loudness]
 # target = -20.0
 #
-# 配列の項目（[mute] processes、[tray] mute_durations）は、minply.toml の値に足さず全体を置き換える。
-# [[mute.window]] は、minply.toml に書いたルールに足して読み込む。
+# 配列の項目（[tray] mute_durations）は、minply.toml の値に足さず全体を置き換える。
+# [[mute]] は、minply.toml に書いた条件に足して読み込む。

@@ -15,8 +15,8 @@
  *   - --session <id> keeps a linger server alive so consecutive playbacks of the
  *     same session skip the lead-in entirely (uninterrupted guard tone)
  *   - Skips playback (exit 0) while a mute condition holds: a configured
- *     process or window title, a microphone/camera in use (tray toggle), or
- *     the tray's manual mute
+ *     [[mute]] rule (process running, window title, sound playing), a
+ *     microphone/camera in use (tray toggle), or the tray's manual mute
  *   - --tray stays in the notification area and offers a manual mute
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
@@ -69,6 +69,7 @@
 #include <new>
 #include <tlhelp32.h>
 #include <audiopolicy.h>
+#include <endpointvolume.h>
 #include <regex>
 #include <unordered_map>
 #include <shellapi.h>
@@ -189,16 +190,23 @@ constexpr wchar_t REG_MUTE_IN_MEETING[]    = L"MuteInMeeting";
 // Upper bound of one timed-mute menu entry (7 days); "indefinite" covers longer
 constexpr uint64_t MUTE_DURATION_MAX_SEC   = 7ULL * 24 * 3600;
 
-// One [[mute.window]] rule: mute while a visible top-level window of the
-// process (exe name, case-insensitive) has a title matching the pattern
-// (ECMAScript, case-insensitive, partial match). A rule missing either key is
-// dropped by LoadConfig.
-struct MuteWindowRule {
+// One [[mute]] rule; every given condition must hold for the rule to match:
+//   - process (required): a process with this exe name runs (case-insensitive)
+//   - title (optional): a visible top-level window of that exe has a title
+//     matching the pattern (ECMAScript, case-insensitive, partial match)
+//   - playing (default false): that exe is producing sound on an active
+//     output device at the moment of the check
+// LoadConfig drops a rule without process, and a rule with an invalid value:
+// dropping the bad key alone would leave a looser rule that mutes far more
+// than intended (e.g. a broken title turning into "while the app runs").
+struct MuteRule {
     std::wstring process;
     std::wstring titlePattern;
     std::wregex  title;
     bool         hasTitle = false;
-    int          line     = 0;      // Line of the [[mute.window]] header, for warnings
+    bool         playing  = false;
+    bool         invalid  = false;  // Some key had an invalid value
+    int          line     = 0;      // Line of the [[mute]] header, for warnings
 };
 
 // One timed-mute entry of the tray menu
@@ -213,8 +221,8 @@ static std::vector<MuteDuration> DefaultMuteDurations();
 //
 // Loaded from minply.toml / minply.local.toml in the executable directory.
 // Missing file or missing key falls back to the default value.
-// muteProcesses and muteDurations are replaced as a whole by the later file
-// that sets them; muteWindows accumulates the rules of both files.
+// muteDurations is replaced as a whole by the later file that sets it;
+// muteRules accumulates the rules of both files.
 struct AppConfig {
     bool  guardEnabled        = true;
     float guardFrequency      = BLE_GUARD_FREQ;
@@ -227,9 +235,8 @@ struct AppConfig {
     float lingerDuration      = LINGER_DURATION;
     int   logRetentionDays    = LOG_RETENTION_DAYS;
     float conditionInterval   = CONDITION_INTERVAL;
-    std::vector<std::wstring>   muteProcesses;
-    std::vector<MuteWindowRule> muteWindows;
-    std::vector<MuteDuration>   muteDurations = DefaultMuteDurations();
+    std::vector<MuteRule>     muteRules;
+    std::vector<MuteDuration> muteDurations = DefaultMuteDurations();
 };
 
 // Convert a UTF-16 string to UTF-8
@@ -1404,9 +1411,10 @@ static std::vector<MuteDuration> DefaultMuteDurations() {
 
 // Parse a subset of TOML into config.
 //
-// Supported: [section] headers, the [[mute.window]] array-of-tables header,
+// Supported: [section] headers, the [[mute]] array-of-tables header,
 // and bool / integer / float / string / one-line string-array values. Unknown sections
-// and keys are silently ignored.
+// and keys are silently ignored, except the pre-v2.0.0 mute forms
+// ([mute] processes, [[mute.window]]), which are ignored with a warning.
 // Returns false when the file cannot be opened, its size cannot be obtained,
 // it exceeds the 1MB cap, or the read fails. The size-cap case also warns
 // (stderr and log), as do parse warnings.
@@ -1461,22 +1469,26 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         size_t lineEnd = content.find('\n', lineStart);
         if (lineEnd == std::string::npos) lineEnd = content.size();
         // Trailing comments are stripped from the whole line, so headers such
-        // as "[[mute.window]] # Meet" are recognized as well as values
+        // as "[[mute]] # Spotify" are recognized as well as values
         std::string line = trim(StripTomlComment(content.substr(lineStart, lineEnd - lineStart)));
         lineStart = lineEnd + 1;
         lineNum++;
 
         if (line.empty() || line[0] == '#') continue;
 
-        // Array-of-tables header. Only [[mute.window]] is known; each header
-        // starts a new rule. The bracketed section name keeps a plain
-        // [mute.window] header from feeding keys into the rule list.
+        // Array-of-tables header. Only [[mute]] is known; each header starts
+        // a new rule. The bracketed section name keeps the plain [mute]
+        // header from feeding keys into the rule list. [[mute.window]] is the
+        // pre-v2.0.0 form: it is reported, and its keys match no branch below.
         if (line.size() >= 4 && line.compare(0, 2, "[[") == 0 && line.compare(line.size() - 2, 2, "]]") == 0) {
             std::string name = trim(line.substr(2, line.size() - 4));
             section = "[[" + name + "]]";
-            if (name == "mute.window") {
-                config.muteWindows.emplace_back();
-                config.muteWindows.back().line = lineNum;
+            if (name == "mute") {
+                config.muteRules.emplace_back();
+                config.muteRules.back().line = lineNum;
+            }
+            else if (name == "mute.window") {
+                PrintWarning("config line " + std::to_string(lineNum) + ": [[mute.window]] is no longer supported; use [[mute]]");
             }
             continue;
         }
@@ -1543,30 +1555,28 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             if (key == "retention_days") parseInt(config.logRetentionDays, 0, LOG_RETENTION_DAYS_MAX);
         }
         else if (section == "mute") {
+            // Pre-v2.0.0 form; the value is not read
             if (key == "processes") {
-                std::vector<std::string> items;
-                if (!ParseTomlStringArray(val, items)) {
-                    warnInvalid();
-                }
-                else {
-                    config.muteProcesses.clear();
-                    for (const auto& item : items) {
-                        if (!item.empty()) config.muteProcesses.push_back(Utf8ToWide(item));
-                    }
-                }
+                PrintWarning("config line " + std::to_string(lineNum) + ": [mute] processes is no longer supported; use [[mute]]");
             }
         }
-        else if (section == "[[mute.window]]") {
+        else if (section == "[[mute]]") {
             // The header handler guarantees at least one rule exists here
-            MuteWindowRule& rule = config.muteWindows.back();
+            MuteRule& rule = config.muteRules.back();
             std::string s;
             if (key == "process") {
-                if (ParseTomlString(val, s) && !s.empty()) rule.process = Utf8ToWide(s);
-                else warnInvalid();
+                if (ParseTomlString(val, s) && !s.empty()) {
+                    rule.process = Utf8ToWide(s);
+                }
+                else {
+                    warnInvalid();
+                    rule.invalid = true;
+                }
             }
             else if (key == "title") {
                 if (!ParseTomlString(val, s)) {
                     warnInvalid();
+                    rule.invalid = true;
                 }
                 else {
                     // Compile once here so a bad pattern is reported with its line number
@@ -1578,8 +1588,13 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
                     }
                     catch (const std::regex_error&) {
                         PrintWarning("config line " + std::to_string(lineNum) + ": invalid regex '" + s + "'");
+                        rule.invalid = true;
                     }
                 }
+            }
+            else if (key == "playing") {
+                if (val != "true" && val != "false") rule.invalid = true;
+                parseBool(rule.playing);
             }
         }
         else if (section == "tray") {
@@ -1609,8 +1624,9 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
 // Load configuration from minply.toml and minply.local.toml in the executable directory.
 //
 // Missing files are silently skipped. Returns default AppConfig if both are absent.
-// [[mute.window]] rules missing process or title are dropped with a warning:
-// one key alone would either match nothing or mute far more than intended.
+// [[mute]] rules missing process, or holding an invalid value, are dropped
+// with a warning (see MuteRule): such a rule would match nothing or match
+// more than intended.
 static AppConfig LoadConfig() {
     AppConfig config;
 
@@ -1619,11 +1635,14 @@ static AppConfig LoadConfig() {
     ParseTomlFile((dir + L"minply.toml").c_str(), config);
     ParseTomlFile((dir + L"minply.local.toml").c_str(), config);
 
-    auto& rules = config.muteWindows;
+    auto& rules = config.muteRules;
     for (auto it = rules.begin(); it != rules.end();) {
-        if (it->process.empty() || !it->hasTitle) {
-            PrintWarning("config line " + std::to_string(it->line)
-                         + ": [[mute.window]] needs both process and title; ignored");
+        std::string problem;
+        if (it->process.empty()) problem = "needs process";
+        else if (it->invalid)    problem = "has an invalid value";
+
+        if (!problem.empty()) {
+            PrintWarning("config line " + std::to_string(it->line) + ": [[mute]] " + problem + "; ignored");
             it = rules.erase(it);
         }
         else {
@@ -1754,6 +1773,73 @@ static bool IsMicCaptureActive() {
     return active;
 }
 
+// Process ids of the sessions producing sound on any active output device
+//
+// - Returns the pid of every non-system-sounds render session whose peak
+//   meter reads above zero at this moment
+// - Skips sessions shared by several processes (no single pid)
+// Requires COM to be initialized on the calling thread.
+// The peak is an instantaneous value: a paused player or the silence between
+// tracks reads zero. A history would catch those gaps but needs state the
+// player does not have, so the instantaneous value is used. The session state
+// is not used: a session stays active while its stream runs, even when the
+// app renders silence.
+static std::vector<DWORD> CollectSoundingPids() {
+    std::vector<DWORD> pids;
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDeviceCollection* collection = nullptr;
+
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)&enumerator))
+        && SUCCEEDED(enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &collection))) {
+        UINT deviceCount = 0;
+        collection->GetCount(&deviceCount);
+
+        for (UINT i = 0; i < deviceCount; i++) {
+            IMMDevice* device = nullptr;
+            IAudioSessionManager2* manager = nullptr;
+            IAudioSessionEnumerator* sessions = nullptr;
+
+            if (SUCCEEDED(collection->Item(i, &device))
+                && SUCCEEDED(device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                              nullptr, (void**)&manager))
+                && SUCCEEDED(manager->GetSessionEnumerator(&sessions))) {
+                int sessionCount = 0;
+                sessions->GetCount(&sessionCount);
+
+                for (int s = 0; s < sessionCount; s++) {
+                    IAudioSessionControl* control = nullptr;
+                    if (FAILED(sessions->GetSession(s, &control))) continue;
+
+                    IAudioSessionControl2* control2 = nullptr;
+                    IAudioMeterInformation* meter = nullptr;
+                    float peak = 0.0f;
+                    DWORD pid = 0;
+                    if (SUCCEEDED(control->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&control2))
+                        && control2->IsSystemSoundsSession() != S_OK
+                        && SUCCEEDED(control->QueryInterface(__uuidof(IAudioMeterInformation), (void**)&meter))
+                        && SUCCEEDED(meter->GetPeakValue(&peak))
+                        && peak > 0.0f
+                        && control2->GetProcessId(&pid) == S_OK) {
+                        pids.push_back(pid);
+                    }
+                    if (meter) meter->Release();
+                    if (control2) control2->Release();
+                    control->Release();
+                }
+            }
+
+            if (sessions) sessions->Release();
+            if (manager) manager->Release();
+            if (device) device->Release();
+        }
+    }
+
+    if (collection) collection->Release();
+    if (enumerator) enumerator->Release();
+    return pids;
+}
+
 // Whether a microphone or camera is in use (taken as "in a meeting")
 //
 // Registry records first (microphone, then camera), then the WASAPI capture
@@ -1800,14 +1886,25 @@ struct MuteMatch {
     std::wstring label;
 };
 
-// Find a [mute] processes or [[mute.window]] match; returns the match, or an empty MuteMatch
+// Find the first [[mute]] rule that holds now; returns the match, or an empty MuteMatch
 //
-// One process snapshot serves both checks. Process names compare
-// case-insensitively against the exe file name. Window titles are matched
-// with regex_search, and a regex_error at match time (e.g. complexity limits)
-// counts as no match rather than aborting playback.
-static MuteMatch FindProcessMuteReason(const AppConfig& config) {
-    if (config.muteProcesses.empty() && config.muteWindows.empty()) return {};
+// - Returns the first rule, in the order written, whose given conditions all hold:
+//   - a process with the rule's exe name runs (case-insensitive)
+//   - where title is given, a visible window of that exe has a title matching it
+//   - where playing is true, that exe is producing sound on an active output device
+// - When no rule holds, returns an empty MuteMatch
+// - If the process snapshot fails, returns an empty MuteMatch
+// The log and label name the exe as written in the rule.
+// Window titles and sounding sessions are gathered at most once per call, and
+// only when a rule that needs them gets that far. Sound is matched by exe
+// name, not by the window's pid, because a browser such as Chrome renders
+// audio from a separate child process of the same exe; as a consequence a
+// browser rule cannot tell which tab produces the sound. A regex_error at
+// match time (e.g. complexity limits) counts as no match rather than aborting
+// playback. COM is initialized here as in IsMeetingActive; on the tray's STA
+// thread the MTA request fails and the existing apartment is used.
+static MuteMatch FindRuleMuteReason(const AppConfig& config) {
+    if (config.muteRules.empty()) return {};
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) return {};
@@ -1820,33 +1917,70 @@ static MuteMatch FindProcessMuteReason(const AppConfig& config) {
     }
     CloseHandle(snapshot);
 
-    for (const auto& name : config.muteProcesses) {
-        for (const auto& p : exeByPid) {
-            if (_wcsicmp(p.second.c_str(), name.c_str()) == 0)
-                return { "process " + WideToUtf8(p.second), p.second + L" 起動中" };
-        }
-    }
+    auto isExe = [&](DWORD pid, const std::wstring& name) {
+        auto exe = exeByPid.find(pid);
+        return exe != exeByPid.end() && _wcsicmp(exe->second.c_str(), name.c_str()) == 0;
+    };
 
-    if (config.muteWindows.empty()) return {};
-
+    bool windowsCollected = false;
     std::vector<WindowTitle> windows;
-    EnumWindows(CollectWindowTitle, reinterpret_cast<LPARAM>(&windows));
+    bool soundCollected = false;
+    std::vector<DWORD> soundingPids;
 
-    for (const auto& rule : config.muteWindows) {
-        for (const auto& w : windows) {
-            auto exe = exeByPid.find(w.pid);
-            if (exe == exeByPid.end() || _wcsicmp(exe->second.c_str(), rule.process.c_str()) != 0) continue;
-            bool matched = false;
-            try {
-                matched = std::regex_search(w.title, rule.title);
+    for (const auto& rule : config.muteRules) {
+        bool running = false;
+        for (const auto& p : exeByPid) {
+            if (_wcsicmp(p.second.c_str(), rule.process.c_str()) == 0) {
+                running = true;
+                break;
             }
-            catch (const std::regex_error&) {
-                matched = false;
-            }
-            if (matched)
-                return { "window " + WideToUtf8(rule.process) + " /" + WideToUtf8(rule.titlePattern) + "/",
-                         rule.process + L" のウィンドウ" };
         }
+        if (!running) continue;
+
+        if (rule.hasTitle) {
+            if (!windowsCollected) {
+                EnumWindows(CollectWindowTitle, reinterpret_cast<LPARAM>(&windows));
+                windowsCollected = true;
+            }
+            bool titled = false;
+            for (const auto& w : windows) {
+                if (!isExe(w.pid, rule.process)) continue;
+                try {
+                    titled = std::regex_search(w.title, rule.title);
+                }
+                catch (const std::regex_error&) {
+                    titled = false;
+                }
+                if (titled) break;
+            }
+            if (!titled) continue;
+        }
+
+        if (rule.playing) {
+            if (!soundCollected) {
+                HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                soundingPids = CollectSoundingPids();
+                if (SUCCEEDED(hr)) CoUninitialize();
+                soundCollected = true;
+            }
+            bool sounding = false;
+            for (DWORD pid : soundingPids) {
+                if (isExe(pid, rule.process)) {
+                    sounding = true;
+                    break;
+                }
+            }
+            if (!sounding) continue;
+        }
+
+        const std::string exe = WideToUtf8(rule.process);
+        if (rule.hasTitle) {
+            const std::string log = "window " + exe + " /" + WideToUtf8(rule.titlePattern) + "/";
+            if (rule.playing) return { log + " playing", rule.process + L" のウィンドウ（再生中）" };
+            return { log, rule.process + L" のウィンドウ" };
+        }
+        if (rule.playing) return { "playing " + exe, rule.process + L" 再生中" };
+        return { "process " + exe, rule.process + L" 起動中" };
     }
     return {};
 }
@@ -1854,12 +1988,12 @@ static MuteMatch FindProcessMuteReason(const AppConfig& config) {
 // Decide whether this playback must be skipped; returns the reason or an empty string
 //
 // Cheapest checks first: the tray's manual mute, then microphone/camera use
-// (only when the tray toggle is on), then process and window rules from the
-// config. The caller exits with EXIT_SUCCESS when a reason is returned.
+// (only when the tray toggle is on), then the [[mute]] rules from the config.
+// The caller exits with EXIT_SUCCESS when a reason is returned.
 static std::string FindMuteReason(const AppConfig& config) {
     if (IsManualMuted()) return "manual mute";
     if (IsMeetingMuteEnabled() && IsMeetingActive()) return "microphone or camera in use";
-    return FindProcessMuteReason(config).log;
+    return FindRuleMuteReason(config).log;
 }
 
 // Read exactly size bytes from an overlapped pipe handle
@@ -2897,9 +3031,10 @@ static void ConfigFileStamp(ULONGLONG stamp[2]) {
 // Mirrors the player's FindMuteReason minus the manual mute, which the tray
 // holds itself. The config is reloaded first when either file changed, so
 // the icon follows the same rules a player would read; mute_durations and
-// condition_interval are deliberately left as loaded at startup. IsMeetingActive's MTA
-// initialization fails on this STA thread and the check then runs on the
-// tray's own COM apartment.
+// condition_interval are deliberately left as loaded at startup. The MTA
+// initialization of IsMeetingActive and of the playing check in
+// FindRuleMuteReason fails on this STA thread, and those checks then run on
+// the tray's own COM apartment.
 static bool TrayRefreshCondition() {
     ULONGLONG stamp[2];
     ConfigFileStamp(stamp);
@@ -2911,7 +3046,7 @@ static bool TrayRefreshCondition() {
 
     std::wstring reason;
     if (IsMeetingMuteEnabled() && IsMeetingActive()) reason = L"マイク/カメラ使用中";
-    else reason = FindProcessMuteReason(g_tray.config).label;
+    else reason = FindRuleMuteReason(g_tray.config).label;
 
     if (reason == g_tray.conditionReason) return false;
     g_tray.conditionReason = reason;
