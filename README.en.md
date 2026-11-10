@@ -175,7 +175,7 @@ The main items are as follows.
 | `loudness` | `target` | The loudness to normalize to |
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
 | `log` | `retention_days` | Days of logs kept when the tray starts (0 keeps all) |
-| `mute` (repeat `[[mute]]`) | `process`, `title`, `playing` | Suppress playback while the app is running, while its window title matches the regular expression, or while it is playing sound (a rule holds when all the conditions written in it hold) |
+| `mute` (repeat `[[mute]]`) | `process`, `title`, `playing`, `hold` | Suppress playback while the app is running, while its window title matches the regular expression, or while it is playing sound (a rule holds when all the conditions written in it hold). `hold` is how many seconds the mute continues after the sound stops (30 seconds by default) |
 | `tray` | `condition_interval` | How often the mute conditions are checked and reflected on the icon (seconds) |
 | `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
 
@@ -188,7 +188,8 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
-- The playing-sound condition reads the volume at that moment, so it does not hold while the app is paused or silent between tracks
+- `hold`, which keeps the mute after the sound stops, works only while the tray is running
+- Without the tray, the playing-sound condition reads only the volume at that moment, so it does not hold while the app is paused or silent between tracks
 - The playing-sound condition is judged per app, so in a browser it cannot tell which tab is playing the sound
 - The tray settings (`condition_interval`, `mute_durations`) are read only when the tray starts
 - The red slash for a mute condition reaches the icon up to `condition_interval` (5 seconds by default) late, both when the condition starts and when it ends

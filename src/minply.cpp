@@ -189,6 +189,13 @@ constexpr wchar_t REG_SETTINGS_KEY[]       = L"Software\\minply";
 constexpr wchar_t REG_MUTE_IN_MEETING[]    = L"MuteInMeeting";
 // Upper bound of one timed-mute menu entry (7 days); "indefinite" covers longer
 constexpr uint64_t MUTE_DURATION_MAX_SEC   = 7ULL * 24 * 3600;
+// Default and upper bound of [[mute]] hold: seconds a playing rule keeps
+// holding after the tray last saw the app produce sound
+constexpr float   MUTE_HOLD_DEFAULT        = 30.0f;
+constexpr float   MUTE_HOLD_MAX            = 3600.0f;
+// Volatile subkey of REG_SETTINGS_KEY where the tray records, per exe name,
+// the GetTickCount64() of the last poll that saw the exe produce sound
+constexpr wchar_t REG_SOUNDING_SUBKEY[]    = L"Sounding";
 
 // One [[mute]] rule; every given condition must hold for the rule to match:
 //   - process (required): a process with this exe name runs (case-insensitive)
@@ -196,6 +203,8 @@ constexpr uint64_t MUTE_DURATION_MAX_SEC   = 7ULL * 24 * 3600;
 //     matching the pattern (ECMAScript, case-insensitive, partial match)
 //   - playing (default false): that exe is producing sound on an active
 //     output device at the moment of the check
+//   - hold (default 30 s, 0 disables; playing rules only): playing also holds
+//     while the tray saw that exe produce sound within the last hold seconds
 // LoadConfig drops a rule without process, and a rule with an invalid value:
 // dropping the bad key alone would leave a looser rule that mutes far more
 // than intended (e.g. a broken title turning into "while the app runs").
@@ -205,6 +214,7 @@ struct MuteRule {
     std::wregex  title;
     bool         hasTitle = false;
     bool         playing  = false;
+    float        hold     = MUTE_HOLD_DEFAULT;
     bool         invalid  = false;  // Some key had an invalid value
     int          line     = 0;      // Line of the [[mute]] header, for warnings
 };
@@ -1516,14 +1526,16 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
         // Rejects values with trailing characters (e.g. '30abc', '-16..0'), non-finite values and
         // values outside [minVal, maxVal]; keeps the existing default on failure. The value arrives
         // with its trailing comment and whitespace already stripped, so a valid '30.0  # note' passes.
-        auto parseFloat = [&](float& dest, float minVal, float maxVal) {
+        // Returns false when the value is rejected.
+        auto parseFloat = [&](float& dest, float minVal, float maxVal) -> bool {
             char* end;
             float v = strtof(val.c_str(), &end);
             if (end == val.c_str() || *end != '\0' || !std::isfinite(v) || v < minVal || v > maxVal) {
                 PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
-                return;
+                return false;
             }
             dest = v;
+            return true;
         };
         // Parse and range-check an integer value; same rejection rules as parseFloat
         auto parseInt = [&](int& dest, int minVal, int maxVal) {
@@ -1595,6 +1607,9 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             else if (key == "playing") {
                 if (val != "true" && val != "false") rule.invalid = true;
                 parseBool(rule.playing);
+            }
+            else if (key == "hold") {
+                if (!parseFloat(rule.hold, 0.0f, MUTE_HOLD_MAX)) rule.invalid = true;
             }
         }
         else if (section == "tray") {
@@ -1780,8 +1795,8 @@ static bool IsMicCaptureActive() {
 // - Skips sessions shared by several processes (no single pid)
 // Requires COM to be initialized on the calling thread.
 // The peak is an instantaneous value: a paused player or the silence between
-// tracks reads zero. A history would catch those gaps but needs state the
-// player does not have, so the instantaneous value is used. The session state
+// tracks reads zero. The gaps are bridged by the hold the tray records (see
+// TrayRecordSounding and IsSoundingHeld). The session state
 // is not used: a session stays active while its stream runs, even when the
 // app renders silence.
 static std::vector<DWORD> CollectSoundingPids() {
@@ -1840,6 +1855,53 @@ static std::vector<DWORD> CollectSoundingPids() {
     return pids;
 }
 
+// Record that the exe was producing sound at this moment (tray side)
+//
+// - Writes GetTickCount64() as a REG_QWORD named exe under
+//   HKCU\<REG_SETTINGS_KEY>\<REG_SOUNDING_SUBKEY>, creating the subkey as volatile
+// - If the key cannot be created or written, does nothing (the hold is lost,
+//   playing falls back to the instantaneous check)
+// The parent key is created first as a normal key: creating the whole path
+// with REG_OPTION_VOLATILE would make Software\minply itself volatile and lose
+// the menu settings stored there at the next reboot. The volatile subkey lives
+// only in memory, so the frequent writes never reach the disk and the records
+// vanish at reboot, where GetTickCount64 restarts.
+static void RecordSounding(const std::wstring& exe) {
+    HKEY parent = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, REG_SETTINGS_KEY, 0, nullptr, 0,
+                        KEY_CREATE_SUB_KEY, nullptr, &parent, nullptr) != ERROR_SUCCESS)
+        return;
+
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(parent, REG_SOUNDING_SUBKEY, 0, nullptr, REG_OPTION_VOLATILE,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        const ULONGLONG now = GetTickCount64();
+        RegSetValueExW(key, exe.c_str(), 0, REG_QWORD, reinterpret_cast<const BYTE*>(&now), sizeof(now));
+        RegCloseKey(key);
+    }
+    RegCloseKey(parent);
+}
+
+// Whether the tray saw the exe produce sound within the last holdSeconds (player side)
+//
+// - Returns false when holdSeconds is 0, when no record exists, or when the
+//   record is newer than now (a value written in an earlier boot)
+// Registry value names are case-insensitive, so the record matches the exe
+// however the rule spells it.
+static bool IsSoundingHeld(const std::wstring& exe, float holdSeconds) {
+    if (holdSeconds <= 0.0f) return false;
+
+    const std::wstring path = std::wstring(REG_SETTINGS_KEY) + L"\\" + REG_SOUNDING_SUBKEY;
+    ULONGLONG recorded = 0;
+    DWORD size = sizeof(recorded);
+    if (RegGetValueW(HKEY_CURRENT_USER, path.c_str(), exe.c_str(), RRF_RT_REG_QWORD,
+                     nullptr, &recorded, &size) != ERROR_SUCCESS)
+        return false;
+
+    const ULONGLONG now = GetTickCount64();
+    return recorded <= now && now - recorded < static_cast<ULONGLONG>(holdSeconds * 1000.0f);
+}
+
 // Whether a microphone or camera is in use (taken as "in a meeting")
 //
 // Registry records first (microphone, then camera), then the WASAPI capture
@@ -1891,10 +1953,12 @@ struct MuteMatch {
 // - Returns the first rule, in the order written, whose given conditions all hold:
 //   - a process with the rule's exe name runs (case-insensitive)
 //   - where title is given, a visible window of that exe has a title matching it
-//   - where playing is true, that exe is producing sound on an active output device
+//   - where playing is true, that exe is producing sound on an active output
+//     device, or the tray saw it do so within the rule's hold seconds
 // - When no rule holds, returns an empty MuteMatch
 // - If the process snapshot fails, returns an empty MuteMatch
-// The log and label name the exe as written in the rule.
+// The log and label name the exe as written in the rule; the log gets
+// " (held)" when only the tray's record satisfied playing.
 // Window titles and sounding sessions are gathered at most once per call, and
 // only when a rule that needs them gets that far. Sound is matched by exe
 // name, not by the window's pid, because a browser such as Chrome renders
@@ -1956,6 +2020,8 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
             if (!titled) continue;
         }
 
+        // held: playing is satisfied only by the tray's record, not by sound now
+        bool held = false;
         if (rule.playing) {
             if (!soundCollected) {
                 HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1970,16 +2036,20 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
                     break;
                 }
             }
-            if (!sounding) continue;
+            if (!sounding) {
+                if (!IsSoundingHeld(rule.process, rule.hold)) continue;
+                held = true;
+            }
         }
 
         const std::string exe = WideToUtf8(rule.process);
+        const std::string heldSuffix = held ? " (held)" : "";
         if (rule.hasTitle) {
             const std::string log = "window " + exe + " /" + WideToUtf8(rule.titlePattern) + "/";
-            if (rule.playing) return { log + " playing", rule.process + L" のウィンドウ（再生中）" };
+            if (rule.playing) return { log + " playing" + heldSuffix, rule.process + L" のウィンドウ（再生中）" };
             return { log, rule.process + L" のウィンドウ" };
         }
-        if (rule.playing) return { "playing " + exe, rule.process + L" 再生中" };
+        if (rule.playing) return { "playing " + exe + heldSuffix, rule.process + L" 再生中" };
         return { "process " + exe, rule.process + L" 起動中" };
     }
     return {};
@@ -3026,15 +3096,56 @@ static void ConfigFileStamp(ULONGLONG stamp[2]) {
     }
 }
 
+// Record the sound state of every exe named by a playing rule with a hold (tray side)
+//
+// - Does nothing when no [[mute]] rule has playing = true and hold > 0
+// - For each such rule whose exe is producing sound now, calls RecordSounding
+// Runs on every condition poll regardless of the other mute conditions, so a
+// gap between tracks is bridged even while another condition holds. The MTA
+// request fails on the tray's STA thread and the existing apartment is used.
+static void TrayRecordSounding() {
+    std::vector<const MuteRule*> targets;
+    for (const auto& rule : g_tray.config.muteRules) {
+        if (rule.playing && rule.hold > 0.0f) targets.push_back(&rule);
+    }
+    if (targets.empty()) return;
+
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const std::vector<DWORD> pids = CollectSoundingPids();
+    if (SUCCEEDED(hr)) CoUninitialize();
+    if (pids.empty()) return;
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return;
+    std::unordered_map<DWORD, std::wstring> exeByPid;
+    PROCESSENTRY32W entry = {};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+        exeByPid[entry.th32ProcessID] = entry.szExeFile;
+    }
+    CloseHandle(snapshot);
+
+    for (const MuteRule* rule : targets) {
+        for (DWORD pid : pids) {
+            auto exe = exeByPid.find(pid);
+            if (exe != exeByPid.end() && _wcsicmp(exe->second.c_str(), rule->process.c_str()) == 0) {
+                RecordSounding(rule->process);
+                break;
+            }
+        }
+    }
+}
+
 // Re-evaluate the condition mutes for the icon; true when the tooltip text changed
 //
 // Mirrors the player's FindMuteReason minus the manual mute, which the tray
 // holds itself. The config is reloaded first when either file changed, so
 // the icon follows the same rules a player would read; mute_durations and
-// condition_interval are deliberately left as loaded at startup. The MTA
-// initialization of IsMeetingActive and of the playing check in
-// FindRuleMuteReason fails on this STA thread, and those checks then run on
-// the tray's own COM apartment.
+// condition_interval are deliberately left as loaded at startup. Records the
+// sound state next (TrayRecordSounding), so the playing hold is fed even
+// while a microphone or camera is in use. The MTA initialization of
+// IsMeetingActive and of the playing check in FindRuleMuteReason fails on
+// this STA thread, and those checks then run on the tray's own COM apartment.
 static bool TrayRefreshCondition() {
     ULONGLONG stamp[2];
     ConfigFileStamp(stamp);
@@ -3043,6 +3154,8 @@ static bool TrayRefreshCondition() {
         g_tray.configStamp[0] = stamp[0];
         g_tray.configStamp[1] = stamp[1];
     }
+
+    TrayRecordSounding();
 
     std::wstring reason;
     if (IsMeetingMuteEnabled() && IsMeetingActive()) reason = L"マイク/カメラ使用中";
