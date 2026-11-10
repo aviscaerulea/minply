@@ -8,7 +8,7 @@
 
 An ultra-lightweight CLI audio player for Windows, made for notification sounds and text-to-speech output.
 
-Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 690KB and needs no additional runtime.
+Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 710KB and needs no additional runtime.
 
 ## Features
 
