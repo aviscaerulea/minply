@@ -17,6 +17,8 @@
  *   - Skips playback (exit 0) while a mute condition holds: a configured
  *     [[mute]] rule (process running, window title, sound playing), a
  *     microphone/camera in use (tray toggle), or the tray's manual mute
+ *   - Lowers the volume to the percent of the first configured [[volume]]
+ *     rule that holds (same conditions as [[mute]]); the guard tone is not scaled
  *   - --tray stays in the notification area and offers a manual mute
  *     (indefinite or timed), the microphone/camera toggle, startup
  *     registration, and shortcuts to the config and log files; a left click
@@ -26,8 +28,8 @@
  *     --tray replaces the running tray
  *   - Each play request briefly marks the tray icon with a green dot,
  *     over the red-slashed icon when the request was muted
- *   - Logs mute decisions, errors, config warnings and tray operations to
- *     <exe dir>\logs
+ *   - Logs mute decisions, [[volume]] matches, errors, config warnings and
+ *     tray operations to <exe dir>\logs
  *   - --uninstall removes the registry entries and the per-user data folder
  *     of older versions, leaving the exe folder (config, logs) to the user
  *   - Exits immediately after playback completes
@@ -189,7 +191,7 @@ constexpr wchar_t REG_SETTINGS_KEY[]       = L"Software\\minply";
 constexpr wchar_t REG_MUTE_IN_MEETING[]    = L"MuteInMeeting";
 // Upper bound of one timed-mute menu entry (7 days); "indefinite" covers longer
 constexpr uint64_t MUTE_DURATION_MAX_SEC   = 7ULL * 24 * 3600;
-// Default and upper bound of [[mute]] hold: seconds a playing rule keeps
+// Default and upper bound of the [[mute]] and [[volume]] hold: seconds a playing rule keeps
 // holding after the tray last saw the app produce sound
 constexpr float   MUTE_HOLD_DEFAULT        = 30.0f;
 constexpr float   MUTE_HOLD_MAX            = 3600.0f;
@@ -197,18 +199,8 @@ constexpr float   MUTE_HOLD_MAX            = 3600.0f;
 // the GetTickCount64() of the last poll that saw the exe produce sound
 constexpr wchar_t REG_SOUNDING_SUBKEY[]    = L"Sounding";
 
-// One [[mute]] rule; every given condition must hold for the rule to match:
-//   - process (required): a process with this exe name runs (case-insensitive)
-//   - title (optional): a visible top-level window of that exe has a title
-//     matching the pattern (ECMAScript, case-insensitive, partial match)
-//   - playing (default false): that exe is producing sound on an active
-//     output device at the moment of the check
-//   - hold (default 30 s, 0 disables; playing rules only): playing also holds
-//     while the tray saw that exe produce sound within the last hold seconds
-// LoadConfig drops a rule without process, and a rule with an invalid value:
-// dropping the bad key alone would leave a looser rule that mutes far more
-// than intended (e.g. a broken title turning into "while the app runs").
-struct MuteRule {
+// One [[mute]] or [[volume]] rule; volume is read only for [[volume]]
+struct ConditionRule {
     std::wstring process;
     std::wstring titlePattern;
     std::wregex  title;
@@ -216,7 +208,8 @@ struct MuteRule {
     bool         playing  = false;
     float        hold     = MUTE_HOLD_DEFAULT;
     bool         invalid  = false;  // Some key had an invalid value
-    int          line     = 0;      // Line of the [[mute]] header, for warnings
+    int          line     = 0;      // Line of the [[mute]] or [[volume]] header, for warnings
+    int          volume   = -1;     // Percent; -1 until the volume key is read
 };
 
 // One timed-mute entry of the tray menu
@@ -227,12 +220,7 @@ struct MuteDuration {
 
 static std::vector<MuteDuration> DefaultMuteDurations();
 
-// Application configuration
-//
-// Loaded from minply.toml / minply.local.toml in the executable directory.
-// Missing file or missing key falls back to the default value.
-// muteDurations is replaced as a whole by the later file that sets it;
-// muteRules accumulates the rules of both files.
+// Application configuration loaded from minply.toml and minply.local.toml
 struct AppConfig {
     bool  guardEnabled        = true;
     float guardFrequency      = BLE_GUARD_FREQ;
@@ -245,8 +233,9 @@ struct AppConfig {
     float lingerDuration      = LINGER_DURATION;
     int   logRetentionDays    = LOG_RETENTION_DAYS;
     float conditionInterval   = CONDITION_INTERVAL;
-    std::vector<MuteRule>     muteRules;
-    std::vector<MuteDuration> muteDurations = DefaultMuteDurations();
+    std::vector<ConditionRule> muteRules;
+    std::vector<ConditionRule> volumeRules;
+    std::vector<MuteDuration>  muteDurations = DefaultMuteDurations();
 };
 
 // Convert a UTF-16 string to UTF-8
@@ -311,8 +300,9 @@ static std::wstring GetTodayLogPath() {
 // Append one line to today's log file
 //
 // Line format: "YYYY-MM-DD HH:MM:SS [<pid>] <message>" in UTF-8 without BOM,
-// local time. Records mute decisions, errors, config warnings and tray
-// operations; successful playbacks are deliberately not logged.
+// local time. Records mute decisions, [[volume]] matches, errors, config
+// warnings and tray operations; a successful playback itself is deliberately
+// not logged.
 // Every call opens, appends with a single WriteFile and closes, so concurrent
 // minply processes interleave whole lines. Failures are ignored: logging must
 // never change the playback outcome.
@@ -1083,12 +1073,18 @@ void ApplyFade(std::vector<float>& audioData, UINT32 sampleRate, UINT32 channels
     }
 }
 
-// Apply loudness normalization (if enabled) and fade in/out to decoded audio
+// Apply loudness normalization (if enabled), the [[volume]] percent and fade in/out to decoded audio
 static void PostProcess(std::vector<float>& audioData, const WAVEFORMATEX* mixFormat,
-                        const AppConfig& config) {
+                        const AppConfig& config, int volumePercent) {
     if (config.loudnessEnabled) {
         NormalizeLoudness(audioData, mixFormat->nSamplesPerSec, mixFormat->nChannels,
                           config.loudnessTarget, config.loudnessPeakCeiling);
+    }
+    if (volumePercent < 100) {
+        const float scale = volumePercent / 100.0f;
+        for (float& s : audioData) {
+            s *= scale;
+        }
     }
     ApplyFade(audioData, mixFormat->nSamplesPerSec, mixFormat->nChannels);
 }
@@ -1421,7 +1417,7 @@ static std::vector<MuteDuration> DefaultMuteDurations() {
 
 // Parse a subset of TOML into config.
 //
-// Supported: [section] headers, the [[mute]] array-of-tables header,
+// Supported: [section] headers, the [[mute]] and [[volume]] array-of-tables headers,
 // and bool / integer / float / string / one-line string-array values. Unknown sections
 // and keys are silently ignored, except the pre-v2.0.0 mute forms
 // ([mute] processes, [[mute.window]]), which are ignored with a warning.
@@ -1486,8 +1482,8 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
 
         if (line.empty() || line[0] == '#') continue;
 
-        // Array-of-tables header. Only [[mute]] is known; each header starts
-        // a new rule. The bracketed section name keeps the plain [mute]
+        // Array-of-tables header. [[mute]] and [[volume]] are known; each header
+        // starts a new rule. The bracketed section name keeps the plain [mute]
         // header from feeding keys into the rule list. [[mute.window]] is the
         // pre-v2.0.0 form: it is reported, and its keys match no branch below.
         if (line.size() >= 4 && line.compare(0, 2, "[[") == 0 && line.compare(line.size() - 2, 2, "]]") == 0) {
@@ -1496,6 +1492,10 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             if (name == "mute") {
                 config.muteRules.emplace_back();
                 config.muteRules.back().line = lineNum;
+            }
+            else if (name == "volume") {
+                config.volumeRules.emplace_back();
+                config.volumeRules.back().line = lineNum;
             }
             else if (name == "mute.window") {
                 PrintWarning("config line " + std::to_string(lineNum) + ": [[mute.window]] is no longer supported; use [[mute]]");
@@ -1537,44 +1537,18 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             dest = v;
             return true;
         };
-        // Parse and range-check an integer value; same rejection rules as parseFloat
-        auto parseInt = [&](int& dest, int minVal, int maxVal) {
+        // Parse and range-check an integer value; same rejection rules and return value as parseFloat
+        auto parseInt = [&](int& dest, int minVal, int maxVal) -> bool {
             char* end;
             long v = strtol(val.c_str(), &end, 10);
             if (end == val.c_str() || *end != '\0' || v < minVal || v > maxVal) {
                 PrintWarning("config line " + std::to_string(lineNum) + ": invalid value '" + val + "'");
-                return;
+                return false;
             }
             dest = static_cast<int>(v);
+            return true;
         };
-
-        if (section == "guard") {
-            if      (key == "enabled")          parseBool(config.guardEnabled);
-            else if (key == "frequency")        parseFloat(config.guardFrequency, 20.0f, 20000.0f);
-            else if (key == "amplitude")        parseFloat(config.guardAmplitude, 0.0f, 1.0f);
-            else if (key == "lead_in_duration") parseFloat(config.leadInDuration, 0.0f, 10.0f);
-            else if (key == "lead_out_duration") parseFloat(config.leadOutDuration, 0.0f, 10.0f);
-        }
-        else if (section == "loudness") {
-            if      (key == "enabled")      parseBool(config.loudnessEnabled);
-            else if (key == "target")       parseFloat(config.loudnessTarget, -70.0f, 0.0f);
-            else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling, 0.001f, 1.0f);
-        }
-        else if (section == "linger") {
-            if (key == "duration") parseFloat(config.lingerDuration, 1.0f, 600.0f);
-        }
-        else if (section == "log") {
-            if (key == "retention_days") parseInt(config.logRetentionDays, 0, LOG_RETENTION_DAYS_MAX);
-        }
-        else if (section == "mute") {
-            // Pre-v2.0.0 form; the value is not read
-            if (key == "processes") {
-                PrintWarning("config line " + std::to_string(lineNum) + ": [mute] processes is no longer supported; use [[mute]]");
-            }
-        }
-        else if (section == "[[mute]]") {
-            // The header handler guarantees at least one rule exists here
-            MuteRule& rule = config.muteRules.back();
+        auto parseRuleKey = [&](ConditionRule& rule) {
             std::string s;
             if (key == "process") {
                 if (ParseTomlString(val, s) && !s.empty()) {
@@ -1611,6 +1585,43 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
             else if (key == "hold") {
                 if (!parseFloat(rule.hold, 0.0f, MUTE_HOLD_MAX)) rule.invalid = true;
             }
+        };
+
+        if (section == "guard") {
+            if      (key == "enabled")          parseBool(config.guardEnabled);
+            else if (key == "frequency")        parseFloat(config.guardFrequency, 20.0f, 20000.0f);
+            else if (key == "amplitude")        parseFloat(config.guardAmplitude, 0.0f, 1.0f);
+            else if (key == "lead_in_duration") parseFloat(config.leadInDuration, 0.0f, 10.0f);
+            else if (key == "lead_out_duration") parseFloat(config.leadOutDuration, 0.0f, 10.0f);
+        }
+        else if (section == "loudness") {
+            if      (key == "enabled")      parseBool(config.loudnessEnabled);
+            else if (key == "target")       parseFloat(config.loudnessTarget, -70.0f, 0.0f);
+            else if (key == "peak_ceiling") parseFloat(config.loudnessPeakCeiling, 0.001f, 1.0f);
+        }
+        else if (section == "linger") {
+            if (key == "duration") parseFloat(config.lingerDuration, 1.0f, 600.0f);
+        }
+        else if (section == "log") {
+            if (key == "retention_days") parseInt(config.logRetentionDays, 0, LOG_RETENTION_DAYS_MAX);
+        }
+        else if (section == "mute") {
+            // Pre-v2.0.0 form; the value is not read
+            if (key == "processes") {
+                PrintWarning("config line " + std::to_string(lineNum) + ": [mute] processes is no longer supported; use [[mute]]");
+            }
+        }
+        else if (section == "[[mute]]" && !config.muteRules.empty()) {
+            parseRuleKey(config.muteRules.back());
+        }
+        else if (section == "[[volume]]" && !config.volumeRules.empty()) {
+            ConditionRule& rule = config.volumeRules.back();
+            if (key == "volume") {
+                if (!parseInt(rule.volume, 0, 100)) rule.invalid = true;
+            }
+            else {
+                parseRuleKey(rule);
+            }
         }
         else if (section == "tray") {
             if (key == "condition_interval") {
@@ -1636,12 +1647,32 @@ static bool ParseTomlFile(const wchar_t* path, AppConfig& config) {
     return true;
 }
 
+// Reason a rule must be dropped, or an empty string when it is usable
+static std::string RuleProblem(const ConditionRule& rule, bool needsVolume) {
+    if (rule.process.empty())           return "needs process";
+    if (rule.invalid)                   return "has an invalid value";
+    if (needsVolume && rule.volume < 0) return "needs volume";
+    return "";
+}
+
+// Drop the rules RuleProblem rejects, warning with the table name
+static void DropBadRules(std::vector<ConditionRule>& rules, const char* table, bool needsVolume) {
+    for (auto it = rules.begin(); it != rules.end();) {
+        const std::string problem = RuleProblem(*it, needsVolume);
+        if (!problem.empty()) {
+            PrintWarning("config line " + std::to_string(it->line) + ": " + table + " " + problem + "; ignored");
+            it = rules.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+}
+
 // Load configuration from minply.toml and minply.local.toml in the executable directory.
 //
 // Missing files are silently skipped. Returns default AppConfig if both are absent.
-// [[mute]] rules missing process, or holding an invalid value, are dropped
-// with a warning (see MuteRule): such a rule would match nothing or match
-// more than intended.
+// [[mute]] and [[volume]] rules that RuleProblem rejects are dropped with a warning.
 static AppConfig LoadConfig() {
     AppConfig config;
 
@@ -1649,21 +1680,8 @@ static AppConfig LoadConfig() {
     if (dir.empty()) return config;
     ParseTomlFile((dir + L"minply.toml").c_str(), config);
     ParseTomlFile((dir + L"minply.local.toml").c_str(), config);
-
-    auto& rules = config.muteRules;
-    for (auto it = rules.begin(); it != rules.end();) {
-        std::string problem;
-        if (it->process.empty()) problem = "needs process";
-        else if (it->invalid)    problem = "has an invalid value";
-
-        if (!problem.empty()) {
-            PrintWarning("config line " + std::to_string(it->line) + ": [[mute]] " + problem + "; ignored");
-            it = rules.erase(it);
-        }
-        else {
-            ++it;
-        }
-    }
+    DropBadRules(config.muteRules, "[[mute]]", false);
+    DropBadRules(config.volumeRules, "[[volume]]", true);
 
     return config;
 }
@@ -1940,38 +1958,13 @@ static BOOL CALLBACK CollectWindowTitle(HWND hwnd, LPARAM param) {
     return TRUE;
 }
 
-// Result of a condition-mute check: log is the English reason for the log
-// ("process Zoom.exe"), label the Japanese text for the tray tooltip
-// ("Zoom.exe 起動中"). Both empty means no match.
-struct MuteMatch {
-    std::string  log;
-    std::wstring label;
-};
-
-// Find the first [[mute]] rule that holds now; returns the match, or an empty MuteMatch
-//
-// - Returns the first rule, in the order written, whose given conditions all hold:
-//   - a process with the rule's exe name runs (case-insensitive)
-//   - where title is given, a visible window of that exe has a title matching it
-//   - where playing is true, that exe is producing sound on an active output
-//     device, or the tray saw it do so within the rule's hold seconds
-// - When no rule holds, returns an empty MuteMatch
-// - If the process snapshot fails, returns an empty MuteMatch
-// The log and label name the exe as written in the rule; the log gets
-// " (held)" when only the tray's record satisfied playing.
-// Window titles and sounding sessions are gathered at most once per call, and
-// only when a rule that needs them gets that far. Sound is matched by exe
-// name, not by the window's pid, because a browser such as Chrome renders
-// audio from a separate child process of the same exe; as a consequence a
-// browser rule cannot tell which tab produces the sound. A regex_error at
-// match time (e.g. complexity limits) counts as no match rather than aborting
-// playback. COM is initialized here as in IsMeetingActive; on the tray's STA
-// thread the MTA request fails and the existing apartment is used.
-static MuteMatch FindRuleMuteReason(const AppConfig& config) {
-    if (config.muteRules.empty()) return {};
+// Index of the first rule, in the order written, whose conditions all hold now, or -1
+static int FindMatchingRule(const std::vector<ConditionRule>& rules, bool& held) {
+    held = false;
+    if (rules.empty()) return -1;
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return {};
+    if (snapshot == INVALID_HANDLE_VALUE) return -1;
 
     std::unordered_map<DWORD, std::wstring> exeByPid;
     PROCESSENTRY32W entry = {};
@@ -1991,7 +1984,8 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
     bool soundCollected = false;
     std::vector<DWORD> soundingPids;
 
-    for (const auto& rule : config.muteRules) {
+    for (size_t i = 0; i < rules.size(); ++i) {
+        const ConditionRule& rule = rules[i];
         bool running = false;
         for (const auto& p : exeByPid) {
             if (_wcsicmp(p.second.c_str(), rule.process.c_str()) == 0) {
@@ -2013,6 +2007,8 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
                     titled = std::regex_search(w.title, rule.title);
                 }
                 catch (const std::regex_error&) {
+                    // The standard library can throw at match time (e.g. complexity
+                    // limits); such a rule counts as not matching rather than aborting playback
                     titled = false;
                 }
                 if (titled) break;
@@ -2021,14 +2017,17 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
         }
 
         // held: playing is satisfied only by the tray's record, not by sound now
-        bool held = false;
+        held = false;
         if (rule.playing) {
             if (!soundCollected) {
+                // On the tray's STA thread the MTA request fails and the existing apartment is used
                 HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
                 soundingPids = CollectSoundingPids();
                 if (SUCCEEDED(hr)) CoUninitialize();
                 soundCollected = true;
             }
+            // Sound is matched by exe name, not by the window's pid: a browser such as
+            // Chrome renders audio from a separate child process of the same exe
             bool sounding = false;
             for (DWORD pid : soundingPids) {
                 if (isExe(pid, rule.process)) {
@@ -2041,18 +2040,36 @@ static MuteMatch FindRuleMuteReason(const AppConfig& config) {
                 held = true;
             }
         }
-
-        const std::string exe = WideToUtf8(rule.process);
-        const std::string heldSuffix = held ? " (held)" : "";
-        if (rule.hasTitle) {
-            const std::string log = "window " + exe + " /" + WideToUtf8(rule.titlePattern) + "/";
-            if (rule.playing) return { log + " playing" + heldSuffix, rule.process + L" のウィンドウ（再生中）" };
-            return { log, rule.process + L" のウィンドウ" };
-        }
-        if (rule.playing) return { "playing " + exe + heldSuffix, rule.process + L" 再生中" };
-        return { "process " + exe, rule.process + L" 起動中" };
+        return static_cast<int>(i);
     }
-    return {};
+    return -1;
+}
+
+// Log text and tray tooltip label naming a matched rule; both empty when no rule matched
+struct RuleMatch {
+    std::string  log;
+    std::wstring label;
+};
+
+// Name a matched rule's conditions, e.g. "process Zoom.exe" for the log and "Zoom.exe 起動中" for the tray
+static RuleMatch DescribeRule(const ConditionRule& rule, bool held) {
+    const std::string exe = WideToUtf8(rule.process);
+    const std::string heldSuffix = held ? " (held)" : "";
+    if (rule.hasTitle) {
+        const std::string log = "window " + exe + " /" + WideToUtf8(rule.titlePattern) + "/";
+        if (rule.playing) return { log + " playing" + heldSuffix, rule.process + L" のウィンドウ（再生中）" };
+        return { log, rule.process + L" のウィンドウ" };
+    }
+    if (rule.playing) return { "playing " + exe + heldSuffix, rule.process + L" 再生中" };
+    return { "process " + exe, rule.process + L" 起動中" };
+}
+
+// Find the first [[mute]] rule that holds now; returns the match, or an empty RuleMatch
+static RuleMatch FindRuleMuteReason(const AppConfig& config) {
+    bool held = false;
+    const int index = FindMatchingRule(config.muteRules, held);
+    if (index < 0) return {};
+    return DescribeRule(config.muteRules[index], held);
 }
 
 // Decide whether this playback must be skipped; returns the reason or an empty string
@@ -2064,6 +2081,17 @@ static std::string FindMuteReason(const AppConfig& config) {
     if (IsManualMuted()) return "manual mute";
     if (IsMeetingMuteEnabled() && IsMeetingActive()) return "microphone or camera in use";
     return FindRuleMuteReason(config).log;
+}
+
+// Percent of the first [[volume]] rule that holds now, logging the match; 100 when none holds
+static int FindVolumePercent(const AppConfig& config) {
+    bool held = false;
+    const int index = FindMatchingRule(config.volumeRules, held);
+    if (index < 0) return 100;
+
+    const ConditionRule& rule = config.volumeRules[index];
+    WriteLog("volume " + std::to_string(rule.volume) + "% (" + DescribeRule(rule, held).log + ")");
+    return rule.volume;
 }
 
 // Read exactly size bytes from an overlapped pipe handle
@@ -2585,7 +2613,7 @@ static int RunServer(const wchar_t* sessionId) {
             // request instead of letting the server process die
             try {
                 decoded_ok = DecodeInput(payload.data(), payload.size(), mixFormat, decoded);
-                if (decoded_ok) PostProcess(decoded, mixFormat, config);
+                if (decoded_ok) PostProcess(decoded, mixFormat, config, FindVolumePercent(config));
             }
             catch (const std::bad_alloc&) {
                 decoded_ok = false;
@@ -2864,7 +2892,7 @@ struct TrayState {
     ULONGLONG  muteUntil        = 0;         // UTC FILETIME of the timed mute's expiry
     size_t     muteIndex        = 0;         // Menu entry chosen for the timed mute
     std::vector<MuteDuration> durations;
-    AppConfig    config;                     // Mute rules for the condition poll; reloaded when the files change
+    AppConfig    config;                     // Rules for the condition poll and the sound record; reloaded when the files change
     ULONGLONG    configStamp[2]  = {};       // Last-write FILETIME of minply.toml and minply.local.toml (0: absent)
     std::wstring conditionReason;            // Tooltip text of the active condition mute; empty when none
 };
@@ -3098,14 +3126,17 @@ static void ConfigFileStamp(ULONGLONG stamp[2]) {
 
 // Record the sound state of every exe named by a playing rule with a hold (tray side)
 //
-// - Does nothing when no [[mute]] rule has playing = true and hold > 0
+// - Does nothing when no [[mute]] or [[volume]] rule has playing = true and hold > 0
 // - For each such rule whose exe is producing sound now, calls RecordSounding
 // Runs on every condition poll regardless of the other mute conditions, so a
 // gap between tracks is bridged even while another condition holds. The MTA
 // request fails on the tray's STA thread and the existing apartment is used.
 static void TrayRecordSounding() {
-    std::vector<const MuteRule*> targets;
+    std::vector<const ConditionRule*> targets;
     for (const auto& rule : g_tray.config.muteRules) {
+        if (rule.playing && rule.hold > 0.0f) targets.push_back(&rule);
+    }
+    for (const auto& rule : g_tray.config.volumeRules) {
         if (rule.playing && rule.hold > 0.0f) targets.push_back(&rule);
     }
     if (targets.empty()) return;
@@ -3125,7 +3156,7 @@ static void TrayRecordSounding() {
     }
     CloseHandle(snapshot);
 
-    for (const MuteRule* rule : targets) {
+    for (const ConditionRule* rule : targets) {
         for (DWORD pid : pids) {
             auto exe = exeByPid.find(pid);
             if (exe != exeByPid.end() && _wcsicmp(exe->second.c_str(), rule->process.c_str()) == 0) {
@@ -3842,7 +3873,7 @@ int wmain(int argc, wchar_t* argv[]) {
         // as a decode failure (exit code 3) instead of an uncaught exception
         try {
             decoded = DecodeInput(inputData.data(), inputData.size(), mixFormat, decodedData);
-            if (decoded) PostProcess(decodedData, mixFormat, config);
+            if (decoded) PostProcess(decodedData, mixFormat, config, FindVolumePercent(config));
         }
         catch (const std::bad_alloc&) {
             decoded = false;

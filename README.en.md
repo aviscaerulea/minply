@@ -8,7 +8,7 @@
 
 An ultra-lightweight CLI audio player for Windows, made for notification sounds and text-to-speech output.
 
-Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 710KB and needs no additional runtime.
+Bluetooth receivers enter a power-saving state after a period of silence, which cuts off the beginning of the next sound they play. minply prevents this clipping by continuously playing an inaudible high-frequency tone before and after the audio. It is a single executable of roughly 720KB and needs no additional runtime.
 
 ## Features
 
@@ -19,6 +19,7 @@ Bluetooth receivers enter a power-saving state after a period of silence, which 
 - Single executable: no installation required, just drop it in place
 - Immediate exit: plays without showing a window and exits as soon as it finishes
 - Mute conditions: detects a specified app running or playing sound, a specific site open in the browser, or a microphone or camera in use, and skips playback
+- Volume rules: plays at a reduced volume, set as a percentage, while a specified app is running or playing sound, or a specific site is open in the browser
 - Manual mute: silences playback from the notification area menu, for a set time or with no time limit
 
 ## Installation
@@ -143,7 +144,7 @@ The manual mute is released when the tray exits. The microphone/camera setting a
 
 ### Log
 
-Errors and configuration file warnings are written to standard error and also appended, one line each, to `logs\YYYY-MM-DD.log` in the same folder as `minply.exe`; successful playbacks are not logged. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play. Each time the tray starts, old logs are deleted, keeping the last 7 days by default.
+Errors and configuration file warnings are written to standard error and also appended, one line each, to `logs\YYYY-MM-DD.log` in the same folder as `minply.exe`; successful playbacks are not logged. When a `[[volume]]` rule matches, the percentage and the matched condition are logged as well. Standard error is not visible when minply runs from a hook or while a `--session` process stays resident, so use this log to find out why a sound did not play. Each time the tray starts, old logs are deleted, keeping the last 7 days by default.
 
 ## Configuration
 
@@ -152,7 +153,7 @@ Write your settings in `minply.local.toml` in the same folder as the executable.
 `minply.toml` is the reference for every setting and its default value, and its comments explain what each item means and how to write it. Each update replaces it with the new version, so do not edit it directly. minply reads `minply.toml` first and then `minply.local.toml`, and the values in the latter take precedence. With Scoop, `minply.local.toml` is carried over across updates.
 
 ```toml
-# Example minply.local.toml: lower the volume, and stay silent while Zoom is running or Spotify is playing
+# Example minply.local.toml: lower the volume, stay silent while Zoom is running or Spotify is playing, and play at half volume while Spotify is running
 [loudness]
 target = -20.0
 
@@ -162,6 +163,10 @@ process = "Zoom.exe"
 [[mute]]
 process = "Spotify.exe"
 playing = true
+
+[[volume]]
+process = "Spotify.exe"
+volume = 50
 ```
 
 The main items are as follows.
@@ -176,10 +181,11 @@ The main items are as follows.
 | `linger` | `duration` | Seconds to stay resident when `--session` is given |
 | `log` | `retention_days` | Days of logs kept when the tray starts (0 keeps all) |
 | `mute` (repeat `[[mute]]`) | `process`, `title`, `playing`, `hold` | Suppress playback while the app is running, while its window title matches the regular expression, or while it is playing sound (a rule holds when all the conditions written in it hold). `hold` is how many seconds the mute continues after the sound stops (30 seconds by default) |
+| `volume` (repeat `[[volume]]`) | `process`, `title`, `playing`, `hold`, `volume` | Conditions are written as in `mute`; when a rule holds, the audio plays at `volume` percent (an integer from 0 to 100). Rules are checked from the top and the first one that holds is used; when a mute condition holds, nothing plays |
 | `tray` | `condition_interval` | How often the mute conditions are checked and reflected on the icon (seconds) |
 | `tray` | `mute_durations` | Manual mute durations shown in the tray menu |
 
-Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log. A `[[mute]]` entry that has an invalid value or no `process`, however, is ignored as a whole with a warning.
+Values outside the allowed range, and invalid values, fall back to the default after a warning is written to standard error and the log. A `[[mute]]` or `[[volume]]` entry that has an invalid value or no `process` (or, for `[[volume]]`, no `volume`), however, is ignored as a whole with a warning.
 
 ## Limitations
 
@@ -188,9 +194,10 @@ Values outside the allowed range, and invalid values, fall back to the default a
 - Configuration files are not reloaded while a `--session` process is resident. Changes take effect from the first playback after it exits
 - Switching the audio device does not terminate the resident process right away. The next invocation terminates it and starts a new one for the new device
 - A browser window title shows only the tab currently displayed in that window, so a site open in a background tab does not match
-- `hold`, which keeps the mute after the sound stops, works only while the tray is running
+- `hold`, which keeps a `[[mute]]` or `[[volume]]` rule holding after the sound stops, works only while the tray is running
 - Without the tray, the playing-sound condition reads only the volume at that moment, so it does not hold while the app is paused or silent between tracks
 - The playing-sound condition is judged per app, so in a browser it cannot tell which tab is playing the sound
+- `[[volume]]` can only lower the volume; it cannot make playback louder than the original
 - The tray settings (`condition_interval`, `mute_durations`) are read only when the tray starts
 - The red slash for a mute condition reaches the icon up to `condition_interval` (5 seconds by default) late, both when the condition starts and when it ends
 - Detecting microphone and camera use relies on the usage records kept by the Windows privacy feature
